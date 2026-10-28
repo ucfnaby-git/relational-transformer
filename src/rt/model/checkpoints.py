@@ -28,6 +28,11 @@ def load_model(path):
     sd = load_file(str(path))
     for k in [k for k in sd if ".boolean" in k]:
         del sd[k]
+    if "enc_dict.rel_time.weight" not in sd:
+        # Predates the relative-time encoder; zero is its identity initialisation.
+        w = sd["enc_dict.number.weight"]
+        sd["enc_dict.rel_time.weight"] = w.new_zeros(w.shape[0], w.shape[0])
+        sd["enc_dict.rel_time.bias"] = w.new_zeros(w.shape[0])
     return sd
 
 

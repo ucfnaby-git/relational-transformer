@@ -243,6 +243,7 @@ class RelationalTransformer(nn.Module):
                 "text": nn.Linear(d_text, d_model, bias=True),
                 "datetime": nn.Linear(1, d_model, bias=True),
                 "col_name": nn.Linear(d_text, d_model, bias=True),
+                "rel_time": nn.Linear(d_model, d_model, bias=True),
             }
         )
         self.dec_dict = nn.ModuleDict(
@@ -269,7 +270,7 @@ class RelationalTransformer(nn.Module):
         self.norm_out = RMSNorm(d_model, eps=1e-6)
         self.d_model = d_model
 
-        for module in self.dec_dict.values():
+        for module in [*self.dec_dict.values(), self.enc_dict["rel_time"]]:
             nn.init.zeros_(module.weight)
             nn.init.zeros_(module.bias)
 
@@ -319,6 +320,7 @@ class RelationalTransformer(nn.Module):
         col_name_idxs = batch["col_name_idxs"]
         table_name_idxs = batch["table_name_idxs"]
         is_padding = batch["is_padding"]
+        seed_time = batch["timestamps"][:, :1]
 
         batch_size, seq_len = node_idxs.shape
         device = node_idxs.device
@@ -338,6 +340,7 @@ class RelationalTransformer(nn.Module):
         )
         sem_types = batch["sem_types"].gather(1, sort_idxs)
         is_targets = batch["is_targets"].gather(1, sort_idxs)
+        timestamps = batch["timestamps"].gather(1, sort_idxs)
         type_values = {}
         for t in SEM_TYPE_NAMES:
             k = t + "_values"
@@ -444,6 +447,17 @@ class RelationalTransformer(nn.Module):
                 self.mask_embs[t]
                 * ((sem_types == i) & is_targets & ~is_padding)[..., None]
             )
+
+        # As RelBench's HeteroTemporalEncoder: sin/cos of the days a row is older
+        # than the seed, at PyG PositionalEncoding's frequencies, in fp32.
+        no_time = torch.iinfo(timestamps.dtype).min
+        has_time = (timestamps != no_time) & (seed_time != no_time) & ~is_padding
+        rel_days = (seed_time.long() - timestamps.long()).float() / (60 * 60 * 24)
+        rel_days = rel_days.masked_fill(~has_time, 0.0)
+        freqs = torch.logspace(0, 1, self.d_model // 2, 1e-4, device=device)
+        angles = rel_days[..., None] * freqs
+        rel_time = torch.cat([angles.sin(), angles.cos()], dim=-1).to(x.dtype)
+        x = x + self.enc_dict["rel_time"](rel_time) * has_time[..., None]
 
         for i, block in enumerate(self.blocks):
             x = block(x, block_masks, kv_sizes)
