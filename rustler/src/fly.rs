@@ -1,5 +1,7 @@
 #[path = "datetime.rs"]
 pub(crate) mod datetime;
+#[path = "numeric.rs"]
+pub(crate) mod numeric;
 
 use crate::common::{
     ArchivedAdj, ArchivedEdge, ArchivedNode, ArchivedOffsets, ArchivedSemType, ArchivedTableType,
@@ -67,6 +69,7 @@ fn fmt_thousands(n: usize) -> String {
 enum BuildError {
     MissingTargetCol,
     NanTargetValue,
+    NonFiniteNumeric(String),
 }
 
 const TIMEOUT_MSG: &str = "timeout_per_item exceeded";
@@ -159,6 +162,7 @@ impl ExactSlices<'_> {
 }
 
 struct Vecs {
+    numeric: Option<numeric::Vecs>,
     exact: Option<ExactVecs>,
     node_idxs: Vec<i32>,
     f2p_nbr_idxs: Vec<i32>,
@@ -183,6 +187,7 @@ struct Vecs {
 }
 
 struct Slices<'a> {
+    numeric: Option<numeric::Slices<'a>>,
     exact: Option<ExactSlices<'a>>,
     node_idxs: &'a mut [i32],
     f2p_nbr_idxs: &'a mut [i32],
@@ -203,10 +208,17 @@ struct Slices<'a> {
 }
 
 impl Vecs {
-    fn new(bs: usize, seq_len: usize, d_text: usize, exact_datetime: bool) -> Self {
+    fn new(
+        bs: usize,
+        seq_len: usize,
+        d_text: usize,
+        exact_datetime: bool,
+        exact_numeric: bool,
+    ) -> Self {
         let l = bs * seq_len;
         Self {
             exact: exact_datetime.then(|| ExactVecs::new(l)),
+            numeric: exact_numeric.then(|| numeric::Vecs::new(l)),
             node_idxs: vec![-1; l],
             f2p_nbr_idxs: vec![-1; l * MAX_F2P_NBRS],
             table_name_idxs: vec![0; l],
@@ -241,6 +253,13 @@ impl Vecs {
             .flat_map(move |v| v.chunks_exact_mut(seq_len))
             .map(Some)
             .chain(std::iter::repeat_with(|| None));
+        let numeric = self
+            .numeric
+            .as_mut()
+            .into_iter()
+            .flat_map(move |v| v.chunks_exact_mut(seq_len))
+            .map(Some)
+            .chain(std::iter::repeat_with(|| None));
         izip!(
             self.node_idxs.chunks_exact_mut(seq_len),
             self.f2p_nbr_idxs.chunks_exact_mut(seq_len * MAX_F2P_NBRS),
@@ -258,7 +277,8 @@ impl Vecs {
             self.timestamps.chunks_exact_mut(seq_len),
             self.seed_node_idxs.chunks_exact_mut(seq_len),
             self.bfs_depths.chunks_exact_mut(seq_len),
-            exact
+            exact,
+            numeric
         )
         .map(
             |(
@@ -279,8 +299,10 @@ impl Vecs {
                 seed_node_idxs,
                 bfs_depths,
                 exact,
+                numeric,
             )| Slices {
                 exact,
+                numeric,
                 node_idxs,
                 f2p_nbr_idxs,
                 table_name_idxs,
@@ -370,6 +392,16 @@ impl Vecs {
                 .unwrap(),
             ("seq_len", self.seq_len).into_py_any(py).unwrap(),
         ];
+        if let Some(numeric) = self.numeric {
+            fields.extend([
+                ("number_features", PyArray1::from_vec(py, numeric.features)).into_py_any(py)?,
+                (
+                    "number_target_values",
+                    PyArray1::from_vec(py, numeric.target_values),
+                )
+                    .into_py_any(py)?,
+            ]);
+        }
         if let Some(exact) = self.exact {
             fields.extend([
                 ("datetime_features", PyArray1::from_vec(py, exact.features)).into_py_any(py)?,
@@ -426,6 +458,7 @@ struct Item {
 #[pyclass]
 pub struct Sampler {
     exact_datetime: bool,
+    exact_numeric: bool,
     global_rank: usize,
     local_rank: usize,
     world_size: usize,
@@ -473,7 +506,7 @@ impl Sampler {
         shuffle_seed, context_seed, target_columns, columns_to_drop,
         cutoff_timestamps, items_per_task, quiet, ignore_data_errors,
         num_prev_skipped, mmap_populate, legacy_boolean, timeout_per_item,
-        vector_db_path=None, exact_datetime=false))]
+        vector_db_path=None, exact_datetime=false, exact_numeric=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -504,6 +537,7 @@ impl Sampler {
         timeout_per_item: f64,
         vector_db_path: Option<String>,
         exact_datetime: bool,
+        exact_numeric: bool,
     ) -> PyResult<Self> {
         py.allow_threads(|| {
             Self::new_impl(
@@ -534,6 +568,7 @@ impl Sampler {
                 timeout_per_item,
                 vector_db_path,
                 exact_datetime,
+                exact_numeric,
             )
         })
         .map_err(pyo3::exceptions::PyValueError::new_err)
@@ -551,15 +586,17 @@ impl Sampler {
         bs: usize,
         ctx_size: usize,
     ) -> PyResult<Vec<PyObject>> {
-        let vecs = match batch_idx {
-            Some(idx) => self.batch(Some(idx), 0, bs, ctx_size),
-            None => {
-                let step = self.step;
-                let r = self.batch(None, step, bs, ctx_size);
-                self.step += self.stride;
-                r
-            }
-        };
+        let vecs = self
+            .batch(
+                batch_idx,
+                if batch_idx.is_some() { 0 } else { self.step },
+                bs,
+                ctx_size,
+            )
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        if batch_idx.is_none() {
+            self.step += self.stride;
+        }
         vecs.into_pyobject(py)
     }
 
@@ -572,21 +609,28 @@ impl Sampler {
     ) -> PyResult<Vec<PyObject>> {
         let bs = node_idxs.len();
         let table_name = &self.dataset_tuples[dataset_idx].1;
-        let mut vecs = Vecs::new(bs, ctx_size, self.d_text, self.exact_datetime);
+        let mut vecs = Vecs::new(
+            bs,
+            ctx_size,
+            self.d_text,
+            self.exact_datetime,
+            self.exact_numeric,
+        );
 
         py.allow_threads(|| {
             vecs.chunks_exact_mut(ctx_size, self.d_text)
                 .enumerate()
                 .par_bridge()
-                .for_each(|(i, slices)| {
+                .try_for_each(|(i, slices)| {
                     let item = Item {
                         dataset_idx: dataset_idx as i32,
                         node_idx: node_idxs[i],
                         table_name: table_name.clone(),
                     };
-                    self.seq(&item, i, slices, 0, ctx_size);
-                });
-        });
+                    self.seq(&item, i, slices, 0, ctx_size)
+                })
+        })
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
         vecs.into_pyobject(py)
     }
@@ -644,6 +688,7 @@ impl Sampler {
         timeout_per_item: f64,
         vector_db_path: Option<String>,
         exact_datetime: bool,
+        exact_numeric: bool,
     ) -> Result<Self, String> {
         let embedder_ref = embedder;
 
@@ -822,6 +867,7 @@ impl Sampler {
         );
         let mut sampler = Self {
             exact_datetime,
+            exact_numeric,
             global_rank,
             local_rank,
             world_size,
@@ -1027,11 +1073,23 @@ impl Sampler {
         self.items.len().div_ceil(bs * self.world_size)
     }
 
-    fn batch(&self, batch_idx: Option<usize>, step: u64, bs: usize, ctx_size: usize) -> Vecs {
+    fn batch(
+        &self,
+        batch_idx: Option<usize>,
+        step: u64,
+        bs: usize,
+        ctx_size: usize,
+    ) -> Result<Vecs, String> {
         match batch_idx {
             Some(idx) => {
                 let offset = self.global_rank * bs + idx * bs * self.world_size;
-                let mut vecs = Vecs::new(bs, ctx_size, self.d_text, self.exact_datetime);
+                let mut vecs = Vecs::new(
+                    bs,
+                    ctx_size,
+                    self.d_text,
+                    self.exact_datetime,
+                    self.exact_numeric,
+                );
 
                 for (i, m) in vecs.batch_mask.iter_mut().enumerate() {
                     *m = offset + i < self.items.len();
@@ -1044,9 +1102,7 @@ impl Sampler {
                     .map(|(i, mut slices)| {
                         let j = offset + i;
                         if j >= self.items.len() {
-
-
-                            return false;
+                            return Ok(false);
                         }
                         let item = &self.items[j];
                         let deadline = Instant::now() + timeout;
@@ -1054,7 +1110,8 @@ impl Sampler {
                             || self.seq_build(item, &mut slices, 0, ctx_size, deadline),
                         ));
                         let reason = match caught {
-                            Ok(Ok(())) => return false,
+                            Ok(Ok(())) => return Ok(false),
+                            Ok(Err(BuildError::NonFiniteNumeric(message))) => return Err(message),
                             Ok(Err(e)) => format!("{e:?}"),
                             Err(p) if panic_msg(&*p) == TIMEOUT_MSG => self.timeout_reason(),
                             Err(p) => panic_msg(&*p).to_string(),
@@ -1063,28 +1120,37 @@ impl Sampler {
                         if let Some(exact) = &mut slices.exact {
                             exact.clear();
                         }
+                        if let Some(numeric) = &mut slices.numeric {
+                            numeric.clear();
+                        }
                         slices.is_padding.fill(true);
                         let db_name = &self.dataset_tuples[item.dataset_idx as usize].0;
                         eprintln!(
                             "\n\x1b[31meval: dropping item (db={}, table={}, node_idx={}) from the metrics: {reason}\x1b[0m",
                             db_name, item.table_name, item.node_idx
                         );
-                        true
+                        Ok(true)
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>, String>>()?;
                 for (i, &failed) in timed_out.iter().enumerate() {
                     if failed {
                         vecs.batch_mask[i] = false;
                     }
                 }
-                vecs
+                Ok(vecs)
             }
             None => {
                 let mut rng = StdRng::seed_from_u64(
                     (self.context_seed + step).wrapping_add(0xE0E0_E0E0_E0E0_E0E0),
                 );
 
-                let mut vecs = Vecs::new(bs, ctx_size, self.d_text, self.exact_datetime);
+                let mut vecs = Vecs::new(
+                    bs,
+                    ctx_size,
+                    self.d_text,
+                    self.exact_datetime,
+                    self.exact_numeric,
+                );
 
                 vecs.batch_mask.iter_mut().for_each(|m| *m = true);
 
@@ -1095,12 +1161,12 @@ impl Sampler {
 
                 vecs.chunks_exact_mut(ctx_size, self.d_text)
                     .enumerate()
-                    .for_each(|(i, slices)| {
+                    .try_for_each(|(i, slices)| {
                         let j = self.global_rank * bs + i;
                         let item = &self.items[global_indices[j]];
-                        self.seq(item, global_indices[j], slices, step, ctx_size);
-                    });
-                vecs
+                        self.seq(item, global_indices[j], slices, step, ctx_size)
+                    })?;
+                Ok(vecs)
             }
         }
     }
@@ -1115,7 +1181,14 @@ impl Sampler {
         )
     }
 
-    fn seq(&self, item: &Item, item_idx: usize, mut slices: Slices, step: u64, ctx_len: usize) {
+    fn seq(
+        &self,
+        item: &Item,
+        item_idx: usize,
+        mut slices: Slices,
+        step: u64,
+        ctx_len: usize,
+    ) -> Result<(), String> {
         let mut current_item = item;
         let mut retry_seed = item_idx as u64;
         let timeout = Duration::from_secs_f64(self.timeout_per_item);
@@ -1125,7 +1198,8 @@ impl Sampler {
                 self.seq_build(current_item, &mut slices, step, ctx_len, deadline)
             }));
             match caught {
-                Ok(Ok(())) => break,
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(BuildError::NonFiniteNumeric(message))) => return Err(message),
                 Ok(Err(_)) => {}
                 Err(panic_info) => {
                     let msg = match panic_msg(&*panic_info) {
@@ -1146,6 +1220,9 @@ impl Sampler {
             slices.is_targets.fill(false);
             if let Some(exact) = &mut slices.exact {
                 exact.clear();
+            }
+            if let Some(numeric) = &mut slices.numeric {
+                numeric.clear();
             }
             slices.is_padding.fill(true);
             let next_idx = StdRng::seed_from_u64(retry_seed).random_range(0..self.items.len());
@@ -1181,6 +1258,7 @@ impl Sampler {
             None => return Err(BuildError::MissingTargetCol),
         };
 
+        self.check_numeric(db_name, target_node, target_cell_i)?;
         let target_value_is_nan = {
             let sem = &target_node.sem_types[target_cell_i];
             match sem {
@@ -1533,6 +1611,7 @@ impl Sampler {
                 last_node_idx = node_idx;
             }
 
+            self.check_numeric(db_name, cached_node.unwrap(), cell_i)?;
             self.add_single_cell(
                 dataset,
                 cached_node.unwrap(),
@@ -1657,6 +1736,26 @@ impl Sampler {
         }
     }
 
+    fn check_numeric(
+        &self,
+        db_name: &str,
+        node: &ArchivedNode,
+        cell: usize,
+    ) -> Result<(), BuildError> {
+        if self.exact_numeric
+            && let Some(value) = numeric::source(node, cell, self.legacy_boolean)
+            && value.to_bits() & 0x7fff_ffff == 0x7f80_0000
+        {
+            return Err(BuildError::NonFiniteNumeric(format!(
+                "exact_numeric=True: infinite numeric source in dataset {db_name:?}, node_idx={}, column_idx={}, bits=0x{:08x}",
+                i32::from(node.node_idx),
+                i32::from(node.col_name_idxs[cell]),
+                value.to_bits()
+            )));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn add_single_cell(
         &self,
@@ -1706,6 +1805,16 @@ impl Sampler {
             ArchivedSemType::Boolean => node.boolean_values[cell_i].into(),
             _ => node.number_values[cell_i].into(),
         });
+
+        if let Some(exact) = &mut slices.numeric
+            && let Some(value) = numeric::source(node, cell_i, self.legacy_boolean)
+        {
+            let features =
+                numeric::features(value).expect("numeric finiteness checked before emission");
+            exact.features[*seq_i * numeric::FEATURES..(*seq_i + 1) * numeric::FEATURES]
+                .copy_from_slice(&features);
+            exact.target_values[*seq_i] = value;
+        }
 
         let text_idx: i32 = node.text_values[cell_i].into();
         slices.text_values[*seq_i * self.d_text..(*seq_i + 1) * self.d_text]
@@ -2205,6 +2314,7 @@ pub fn main(cli: Cli) {
         1.0,
         None,
         false,
+        false,
     )
     .expect("cannot load sampler");
     println!("Sampler loaded in {:?}", tic.elapsed());
@@ -2215,7 +2325,9 @@ pub fn main(cli: Cli) {
     for _ in 0..cli.num_trials {
         let tic = Instant::now();
         let batch_idx = rng.random_range(0..sampler.len(cli.bs));
-        let _vecs = sampler.batch(Some(batch_idx), 0, cli.bs, cli.seq_len);
+        let _vecs = sampler
+            .batch(Some(batch_idx), 0, cli.bs, cli.seq_len)
+            .expect("cannot build batch");
         let elapsed = tic.elapsed().as_millis();
         sum += elapsed;
         sum_sq += elapsed * elapsed;

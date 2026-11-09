@@ -18,6 +18,8 @@ def phase_one(
     total_steps: int,
     early_stop_after_steps: int | None,
     datetime_encoding: str = "scalar",
+    numeric_encoding: str = "scalar",
+    exact_numeric: bool = False,
 ) -> Job:
     return Job(
         name="phase1-plurel",
@@ -33,6 +35,8 @@ def phase_one(
             "materialize_attn_masks": True,
             "loss_fn": "huber",
             "datetime_encoding": datetime_encoding,
+            "numeric_encoding": numeric_encoding,
+            "exact_numeric": exact_numeric,
             "load_ckpt_path": None,
             "db_task_list": "data/db-task-lists/rt-plurel-train.json",
             "train_splits": ["train"],
@@ -112,6 +116,8 @@ def phase_two(
     total_steps: int,
     early_stop_after_steps: int | None,
     datetime_encoding: str = "scalar",
+    numeric_encoding: str = "scalar",
+    exact_numeric: bool = False,
 ) -> Job:
     return Job(
         name="phase2-the-join",
@@ -127,6 +133,8 @@ def phase_two(
             "materialize_attn_masks": True,
             "loss_fn": "huber",
             "datetime_encoding": datetime_encoding,
+            "numeric_encoding": numeric_encoding,
+            "exact_numeric": exact_numeric,
             "load_ckpt_path": load_ckpt_path,
             "db_task_list": "data/db-task-lists/rt-j.json",
             "train_splits": ["train"],
@@ -208,8 +216,10 @@ def jobs(
     total_steps: int,
     early_stop_after_steps: int | None,
     datetime_encoding: str = "scalar",
+    numeric_encoding: str = "scalar",
+    exact_numeric: bool = False,
 ) -> list[Job]:
-    """Use scalar for pinned legacy archives; opt both phases into calendar explicitly."""
+    """Legacy encodings by default; opt into calendar/bits and FP32 eval truth explicitly."""
     return [
         phase_one(
             pre_dir=plurel_pre_dir,
@@ -225,6 +235,8 @@ def jobs(
             total_steps=total_steps,
             early_stop_after_steps=early_stop_after_steps,
             datetime_encoding=datetime_encoding,
+            numeric_encoding=numeric_encoding,
+            exact_numeric=exact_numeric,
         ),
         phase_two(
             load_ckpt_path=phase_two_load_ckpt_path,
@@ -241,6 +253,8 @@ def jobs(
             total_steps=total_steps,
             early_stop_after_steps=early_stop_after_steps,
             datetime_encoding=datetime_encoding,
+            numeric_encoding=numeric_encoding,
+            exact_numeric=exact_numeric,
         ),
     ]
 

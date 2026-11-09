@@ -54,8 +54,11 @@ def process_batch(tup, d_text):
     seq_len = out.pop("seq_len")
 
     for k, v in out.items():
+        if k == "number_features" and v.dtype != np.dtype("bfloat16"):
+            raise ValueError("number_features must have native BF16 dtype")
         if k in [
             "number_values",
+            "number_features",
             "datetime_values",
             "datetime_features",
             "text_values",
@@ -91,6 +94,19 @@ def process_batch(tup, d_text):
         for key in ("datetime_seconds", "datetime_nanoseconds", "datetime_valid"):
             out[key] = out[key].view(-1, seq_len)
 
+    if "number_features" in out or "number_target_values" in out:
+        if not {"number_features", "number_target_values"} <= out.keys():
+            raise ValueError("exact numeric batches require features and FP32 targets")
+        if out["number_target_values"].dtype != torch.float32:
+            raise ValueError("number_target_values must contain source FP32 values")
+        out["number_features"] = out["number_features"].view(-1, seq_len, 5)
+        out["number_target_values"] = out["number_target_values"].view(-1, seq_len, 1)
+        if (
+            out["number_features"].shape[:2] != out["number_values"].shape[:2]
+            or out["number_target_values"].shape != out["number_values"].shape
+        ):
+            raise ValueError("exact numeric fields must align with number_values")
+
     return out
 
 
@@ -121,7 +137,9 @@ class RustlerDataset:
         vector_db_path: str | None,
         db_cutoff: str | int | None,
         exact_datetime: bool = False,
+        exact_numeric: bool = False,
     ):
+        self.exact_numeric = exact_numeric
         pre_dir = resolve_pre_dir(pre_dir)
         if vector_db_path is not None:
             vector_db_path = str(Path(vector_db_path).expanduser())
@@ -225,13 +243,22 @@ class RustlerDataset:
             timeout_per_item=timeout_per_item,
             vector_db_path=vector_db_path,
             **({"exact_datetime": True} if exact_datetime else {}),
+            **({"exact_numeric": True} if exact_numeric else {}),
         )
         self.num_items = self.sampler.num_items
 
         self.d_text = d_text
 
     def _process_batch(self, tup):
-        return process_batch(tup, self.d_text)
+        batch = process_batch(tup, self.d_text)
+        if (
+            self.exact_numeric
+            and not {"number_features", "number_target_values"} <= batch.keys()
+        ):
+            raise ValueError(
+                "exact_numeric=True requires native numeric features and targets"
+            )
+        return batch
 
 
 class TrainDataset(RustlerDataset, IterableDataset):
@@ -262,6 +289,7 @@ class TrainDataset(RustlerDataset, IterableDataset):
         db_cutoff: str | int | None,
         start_step: int = 0,
         exact_datetime: bool = False,
+        exact_numeric: bool = False,
     ):
         RustlerDataset.__init__(
             self,
@@ -289,6 +317,7 @@ class TrainDataset(RustlerDataset, IterableDataset):
             vector_db_path=vector_db_path,
             db_cutoff=db_cutoff,
             exact_datetime=exact_datetime,
+            exact_numeric=exact_numeric,
         )
         self.train_ctx_size_list = train_ctx_size_list
         self.seed = random.Random(seed).getrandbits(64)

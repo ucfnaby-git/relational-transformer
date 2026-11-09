@@ -1608,6 +1608,7 @@ mod tests {
             5.0,
             None,
             exact,
+            false,
         )
     }
 
@@ -1676,12 +1677,14 @@ mod tests {
         );
         let legacy = sampler(&pre, "events", false)
             .unwrap()
-            .batch(Some(0), 0, 4, 4);
+            .batch(Some(0), 0, 4, 4)
+            .unwrap();
         assert!(legacy.exact.is_none());
         backfill(&raw, &pre, None).unwrap();
         let exact = sampler(&pre, "events", true)
             .unwrap()
-            .batch(Some(0), 0, 4, 4);
+            .batch(Some(0), 0, 4, 4)
+            .unwrap();
         assert_eq!(legacy.node_idxs, exact.node_idxs);
         assert_eq!(legacy.f2p_nbr_idxs, exact.f2p_nbr_idxs);
         assert_eq!(legacy.table_name_idxs, exact.table_name_idxs);
@@ -1876,11 +1879,13 @@ mod tests {
             assert_eq!(sidecar.normalization.count, if present { 2 } else { 0 });
             let legacy = sampler(&pre, "events", false)
                 .unwrap()
-                .batch(Some(0), 0, 2, 4);
+                .batch(Some(0), 0, 2, 4)
+                .unwrap();
             assert!(legacy.batch_mask.iter().all(|v| !v));
             let exact = sampler(&pre, "events", true)
                 .unwrap()
-                .batch(Some(0), 0, 2, 4);
+                .batch(Some(0), 0, 2, 4)
+                .unwrap();
             assert!(exact.batch_mask.iter().all(|v| *v == present));
             let fields = exact.exact.as_ref().unwrap();
             assert_eq!(fields.valid.iter().filter(|v| **v).count() > 0, present);

@@ -4,6 +4,25 @@ import uuid
 from pathlib import Path
 
 
+def _numeric_settings(ckpt, exact_numeric):
+    from rt.model.checkpoints import resolve_checkpoint
+
+    config, _ = resolve_checkpoint(ckpt)
+    encoding = config.get("model", {}).get("numeric_encoding", "scalar")
+    return encoding, exact_numeric or encoding == "bits"
+
+
+def _check_numeric_state(state, numeric_encoding, exact_numeric):
+    if (
+        str(state.get("numeric_encoding", "scalar")) != numeric_encoding
+        or bool(state.get("exact_numeric", False)) != exact_numeric
+    ):
+        raise ValueError(
+            "Saved ICL results use different numeric encoding/evaluation truth; "
+            "use a fresh output directory"
+        )
+
+
 def main(
     *,
     variant: str,
@@ -29,12 +48,10 @@ def main(
     mmap_populate: bool,
     db_cutoff: str | int | None,
     ckpt: str,
+    exact_numeric: bool = False,
 ) -> None:
     out = Path(out_dir).expanduser()
     final_path = out / f"{db}__{table}.json"
-    if final_path.exists():
-        print(f"{final_path} exists; nothing to do", flush=True)
-        return
     state_path = out / f"{db}__{table}.state.npz"
 
     import numpy as np
@@ -46,6 +63,13 @@ def main(
     from rt.eval.metrics import metric_for
     from rt.model import load_rt_model
 
+    numeric_encoding, exact_numeric = _numeric_settings(ckpt, exact_numeric)
+    if final_path.exists():
+        saved = json.loads(final_path.read_text())
+        _check_numeric_state(saved.get("config", {}), numeric_encoding, exact_numeric)
+        print(f"{final_path} exists; nothing to do", flush=True)
+        return
+
     (task,) = get_tasks(pre_dir, [(db, table)], (split,))
     model, config = load_rt_model(ckpt, device=device, compile=device == "cuda")
     model = model.set_compute_dtype(torch.bfloat16)
@@ -55,6 +79,7 @@ def main(
     start = 0
     if state_path.exists():
         st = np.load(state_path)
+        _check_numeric_state(st, numeric_encoding, exact_numeric)
         sum_preds, labels0, nodes0 = st["sum_preds"], st["labels"], st["node_idxs"]
         start = int(st["seeds"])
         curve = json.loads(str(st["curve"]))
@@ -83,6 +108,7 @@ def main(
             vector_db_path=None,
             db_cutoff=db_cutoff,
             exact_datetime=model.datetime_encoding == "calendar",
+            exact_numeric=exact_numeric,
         )
         ((_t, _ctx, labels, preds_by_prefix, _nl, node_idxs),) = list(
             ev.evaluate_raw([(model, "")], [ctx_size], with_node_idxs=True)
@@ -106,6 +132,8 @@ def main(
             node_idxs=nodes0,
             seeds=k,
             curve=json.dumps(curve),
+            numeric_encoding=numeric_encoding,
+            exact_numeric=exact_numeric,
         )
         os.replace(tmp, state_path)
         del ev
@@ -130,6 +158,8 @@ def main(
             "db_cutoff": db_cutoff,
             "split": split,
             "checkpoint": ckpt,
+            "numeric_encoding": numeric_encoding,
+            "exact_numeric": exact_numeric,
         },
     }
     tmp = out / f".tmp.{os.getpid()}.{uuid.uuid4().hex}.json"

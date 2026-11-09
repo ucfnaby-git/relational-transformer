@@ -8,6 +8,36 @@ from rt.data import EvalDataset, RustlerDataset
 from rt.utils import fmt_duration, log
 
 
+def _numeric_labels(batch, batch_mask, *, require_exact=False):
+    if "number_target_values" not in batch:
+        if require_exact:
+            raise ValueError("exact_numeric=True requires number_target_values")
+        # Preserve legacy label selection and BF16 arithmetic when not supplied.
+        vals = batch["number_values"].squeeze(-1)
+        return (vals * batch["is_targets"].to(vals.dtype)).sum(dim=1)
+
+    values = batch["number_target_values"]
+    expected = (*batch["is_targets"].shape, 1)
+    if values.dtype != torch.float32 or values.shape != expected:
+        raise ValueError("number_target_values must be FP32 with shape [B, S, 1]")
+    targets = batch["is_targets"] & ~batch["is_padding"]
+    if not (targets.sum(dim=1)[batch_mask] == 1).all():
+        raise ValueError("numeric evaluation requires one target per valid item")
+    # Gather instead of multiply/sum: masked nonfinites cannot contaminate labels,
+    # and source FP32 bits (including signed zero/subnormals) need no arithmetic.
+    index = targets.to(torch.int64).argmax(dim=1, keepdim=True)
+    semantic_types = batch["sem_types"].gather(1, index).squeeze(1)
+    if not (semantic_types[batch_mask] == 0).all():
+        raise ValueError(
+            "FP32 numeric evaluation requires Number targets (sem_types=0)"
+        )
+    labels = values.squeeze(-1).gather(1, index).squeeze(1)
+    labels = torch.where(batch_mask, labels, 0.0)
+    if not torch.isfinite(labels).all():
+        raise ValueError("numeric evaluation targets must be finite")
+    return labels
+
+
 class Evaluator:
     def __init__(
         self,
@@ -39,6 +69,7 @@ class Evaluator:
         ddp,
         device,
         exact_datetime=False,
+        exact_numeric=False,
     ):
         self.tasks = [t for t in tasks if "synthetic" not in t.db_name]
         self.eval_splits = sorted({t.split for t in self.tasks if t.split})
@@ -50,6 +81,7 @@ class Evaluator:
         self.world_size = world_size
         self.ddp = ddp
         self.device = device
+        self.exact_numeric = exact_numeric
 
         max_eval_ctx_size = max(ctx_size_list)
 
@@ -86,6 +118,7 @@ class Evaluator:
                 vector_db_path=vector_db_path,
                 db_cutoff=db_cutoff,
                 exact_datetime=exact_datetime,
+                exact_numeric=exact_numeric,
             )
             total_items += rustler_dataset.num_items
             eval_dataset = EvalDataset(
@@ -183,6 +216,11 @@ class Evaluator:
                             "Task evaluation predicts numeric targets; datetime "
                             "targets are only supported by reconstruction loss."
                         )
+                    y = _numeric_labels(
+                        batch,
+                        batch_mask,
+                        require_exact=getattr(self, "exact_numeric", False),
+                    )
 
                     for eval_ctx_size in eval_ctx_size_list_to_use:
                         tb = {k: v[:, :eval_ctx_size] for k, v in batch.items()}
@@ -224,8 +262,6 @@ class Evaluator:
                     _sync()
                     t_predict += time.perf_counter() - _t
 
-                    vals = batch["number_values"].squeeze(-1)
-                    y = (vals * batch["is_targets"].to(vals.dtype)).sum(dim=1)
                     assert y.size(0) == batch_mask.size(0)
                     labels.append(y)
                     batch_masks.append(batch_mask)

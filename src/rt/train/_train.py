@@ -125,6 +125,19 @@ def _resolve_datetime_encoding(requested, checkpoint_encoding=None):
     return encoding
 
 
+def _resolve_numeric_encoding(requested, checkpoint_encoding=None):
+    encoding = requested if requested is not None else checkpoint_encoding or "scalar"
+    if encoding not in ("scalar", "bits"):
+        raise ValueError(f"unknown numeric_encoding={encoding!r}")
+    if checkpoint_encoding is not None and encoding != checkpoint_encoding:
+        raise ValueError(
+            f"numeric_encoding={encoding!r} does not match checkpoint "
+            f"numeric_encoding={checkpoint_encoding!r}; use a same-schema checkpoint "
+            "or explicitly migrate it into a new run (reset optimizer and SWA state)"
+        )
+    return encoding
+
+
 @torch.no_grad()
 def _init_master_params(net, state=None, *, ddp=False):
     named = dict(net.named_parameters())
@@ -157,6 +170,8 @@ def main(
     materialize_attn_masks: bool,
     loss_fn: str,
     datetime_encoding: str | None = None,
+    numeric_encoding: str | None = None,
+    exact_numeric: bool = False,
     load_ckpt_path: str | None,
     db_task_list: list[tuple[str, str]] | str,
     train_splits: list[str],
@@ -262,15 +277,39 @@ def main(
     datetime_encoding = _resolve_datetime_encoding(
         datetime_encoding, checkpoint_encoding
     )
+    checkpoint_numeric_encoding = (
+        resume.get("numeric_encoding", "scalar")
+        if resume is not None
+        else checkpoint_config.get("model", {}).get("numeric_encoding", "scalar")
+        if ckpt_path is not None
+        else None
+    )
+    numeric_encoding = _resolve_numeric_encoding(
+        numeric_encoding, checkpoint_numeric_encoding
+    )
+    exact_numeric = exact_numeric or numeric_encoding == "bits"
+    if resume is not None and exact_numeric != resume.get("exact_numeric", False):
+        raise ValueError(
+            "exact_numeric does not match resume evaluation truth; use the saved "
+            "setting or start a new run to reset checkpoint selection"
+        )
     if delta_finetune and ckpt_path is not None:
         _resolve_datetime_encoding(
             datetime_encoding,
             checkpoint_config.get("model", {}).get("datetime_encoding", "scalar"),
         )
+        _resolve_numeric_encoding(
+            numeric_encoding,
+            checkpoint_config.get("model", {}).get("numeric_encoding", "scalar"),
+        )
     params["datetime_encoding"] = datetime_encoding
+    params["numeric_encoding"] = numeric_encoding
+    params["exact_numeric"] = exact_numeric
     if is_main:
         log(
             datetime_encoding=datetime_encoding,
+            numeric_encoding=numeric_encoding,
+            exact_numeric=exact_numeric,
             master_initialization="fp32_before_compute_cast",
             resume_master_initialization=(
                 resume.get("master_initialization", "legacy_bf16_before_master")
@@ -336,6 +375,7 @@ def main(
             materialize_attn_masks=materialize_attn_masks,
             loss_fn=loss_fn,
             datetime_encoding=datetime_encoding,
+            numeric_encoding=numeric_encoding,
         ).to(device=device, dtype=torch.float32)
 
     net = build_net()
@@ -344,7 +384,12 @@ def main(
         raise ValueError(f"{resume_path} carries no FP32 master weights; cannot resume")
     if resume is None and ckpt_path is not None:
         raw_net.load_state_dict(
-            load_model(ckpt_path, datetime_encoding=datetime_encoding), strict=True
+            load_model(
+                ckpt_path,
+                datetime_encoding=datetime_encoding,
+                numeric_encoding=numeric_encoding,
+            ),
+            strict=True,
         )
         if is_main:
             log(warm_started_from=load_ckpt_path)
@@ -454,7 +499,11 @@ def main(
 
     delta_base = None
     if delta_finetune:
-        base_sd = load_model(ckpt_path, datetime_encoding=datetime_encoding)
+        base_sd = load_model(
+            ckpt_path,
+            datetime_encoding=datetime_encoding,
+            numeric_encoding=numeric_encoding,
+        )
         delta_base = {
             n: base_sd[n].to(p.device, torch.float32)
             for n, p in master.items()
@@ -472,6 +521,15 @@ def main(
             f"{'set' if ck['swa'] is not None else 'None'}; this run has the other"
         )
         if swa is not None:
+            for name, value in ck["swa"]["params"].items():
+                if (
+                    name not in master
+                    or value.dtype != torch.float32
+                    or value.shape != master[name].shape
+                ):
+                    raise ValueError(
+                        f"{name}: expected matching FP32 SWA state before resume"
+                    )
             swa.load_state_dict(ck["swa"])
         start_step = ck["step"]
         best = ck["best"]
@@ -525,6 +583,7 @@ def main(
         vector_db_path=vector_db_path,
         db_cutoff=db_cutoff,
         exact_datetime=datetime_encoding == "calendar",
+        exact_numeric=exact_numeric,
     )
     total_items = total_steps * total_bs
     stream_items = train_ds.num_items
@@ -628,6 +687,7 @@ def main(
                         ddp=ddp,
                         device=device,
                         exact_datetime=datetime_encoding == "calendar",
+                        exact_numeric=exact_numeric,
                     )
                     for member in range(eval_ensemble_size)
                 ],
@@ -654,6 +714,7 @@ def main(
                     "embedder": embedder,
                     "d_text": d_text,
                     "checkpoint_file": "model.safetensors",
+                    "exact_numeric": exact_numeric,
                     "model": {
                         "num_blocks": num_blocks,
                         "d_model": d_model,
@@ -663,6 +724,7 @@ def main(
                         "materialize_attn_masks": materialize_attn_masks,
                         "loss_fn": loss_fn,
                         "datetime_encoding": datetime_encoding,
+                        "numeric_encoding": numeric_encoding,
                     },
                 },
                 indent=2,
@@ -679,6 +741,8 @@ def main(
                 torch.save(
                     {
                         "datetime_encoding": datetime_encoding,
+                        "numeric_encoding": numeric_encoding,
+                        "exact_numeric": exact_numeric,
                         "master_initialization": "fp32_before_compute_cast",
                         "master": {n: t.detach().cpu() for n, t in master.items()},
                         "optimizers": [o.state_dict() for o in opts],
@@ -716,7 +780,12 @@ def main(
         save_model(
             raw_net.state_dict(),
             live,
-            metadata={"step": step, "datetime_encoding": datetime_encoding},
+            metadata={
+                "step": step,
+                "datetime_encoding": datetime_encoding,
+                "numeric_encoding": numeric_encoding,
+                "exact_numeric": exact_numeric,
+            },
         )
         publish_latest(live, "latest.safetensors")
         if swa is not None and swa.n > 0:
@@ -729,6 +798,8 @@ def main(
                     "step": step,
                     "swa_n": swa.n,
                     "datetime_encoding": datetime_encoding,
+                    "numeric_encoding": numeric_encoding,
+                    "exact_numeric": exact_numeric,
                 },
             )
             publish_latest(swa_ckpt, "latest_swa.safetensors")

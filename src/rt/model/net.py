@@ -269,6 +269,7 @@ class RelationalTransformer(nn.Module):
         materialize_attn_masks,
         loss_fn="huber",
         datetime_encoding="scalar",
+        numeric_encoding="scalar",
     ):
         super().__init__()
         if loss_fn not in ("huber", "l1", "bce"):
@@ -280,12 +281,20 @@ class RelationalTransformer(nn.Module):
                 f"unknown datetime_encoding {datetime_encoding!r}; "
                 "expected 'scalar' or 'calendar'"
             )
+        if numeric_encoding not in ("scalar", "bits"):
+            raise ValueError(
+                f"unknown numeric_encoding {numeric_encoding!r}; "
+                "expected 'scalar' or 'bits'"
+            )
         self.datetime_encoding = datetime_encoding
+        self.numeric_encoding = numeric_encoding
         self.materialize_attn_masks = materialize_attn_masks
         self.loss_fn = loss_fn
         self.enc_dict = nn.ModuleDict(
             {
-                "number": nn.Linear(1, d_model, bias=True),
+                "number": nn.Linear(
+                    5 if numeric_encoding == "bits" else 1, d_model, bias=True
+                ),
                 "text": nn.Linear(d_text, d_model, bias=True),
                 "datetime": nn.Linear(
                     14 if datetime_encoding == "calendar" else 1, d_model, bias=True
@@ -323,6 +332,8 @@ class RelationalTransformer(nn.Module):
 
         if datetime_encoding == "calendar":
             self.dec_dict["datetime"].float()
+        if numeric_encoding == "bits":
+            self.dec_dict["number"].float()
 
         if compile:
             self.forward = torch.compile(self.forward, dynamic=False)
@@ -334,26 +345,35 @@ class RelationalTransformer(nn.Module):
         before this call. Optimizer/SWA state should use those masters, not copies
         of the already narrowed live body. This method does not create masters.
 
-        Calendar context and the Transformer use ``dtype``; the scalar datetime
-        head retains FP32 parameters. Unlike ``self.to(dtype).float()`` on the
-        head, this never rounds its weights through the body dtype. Device-only
-        ``model.to(device)`` remains supported. Scalar models keep ordinary
-        whole-model casting for checkpoint/output compatibility.
+        Context encoders and the Transformer use ``dtype``. Calendar datetime
+        and bits numeric heads retain FP32 parameters without first rounding
+        through the body dtype. Device-only ``model.to(device)`` remains
+        supported. When both encodings are scalar, whole-model casting
+        preserves legacy checkpoint/output compatibility.
 
-        Move calendar models to CUDA before this call so the effective IEEE
+        Move precision-mode models to CUDA before this call so the effective IEEE
         matmul policy is checked before casting. If moving to CUDA afterwards
         or using custom setup, call ``validate_cuda_matmul_precision()`` before
         the first compiled forward. Keep the validated policy fixed through
         forward/backward; this method never changes global precision settings.
         """
-        if self.datetime_encoding == "scalar":
+        if self.datetime_encoding == "scalar" and self.numeric_encoding == "scalar":
             return self.to(dtype=dtype)
-        if self.dec_dict["datetime"].weight.device.type == "cuda":
+        if (
+            self.datetime_encoding == "calendar"
+            and self.dec_dict["datetime"].weight.device.type == "cuda"
+        ) or (
+            self.numeric_encoding == "bits"
+            and self.dec_dict["number"].weight.device.type == "cuda"
+        ):
             validate_cuda_matmul_precision()
         for name, module in self.named_children():
             if name == "dec_dict":
                 for sem_type, head in module.items():
-                    head.to(dtype=torch.float32 if sem_type == "datetime" else dtype)
+                    precise = (
+                        sem_type == "datetime" and self.datetime_encoding == "calendar"
+                    ) or (sem_type == "number" and self.numeric_encoding == "bits")
+                    head.to(dtype=torch.float32 if precise else dtype)
             else:
                 module.to(dtype=dtype)
         return self
@@ -395,23 +415,59 @@ class RelationalTransformer(nn.Module):
             values[key] = value.gather(1, indices)
         return values
 
-    def _calendar_loss(self, x, type_values, sem_types, is_targets, is_padding, valid):
+    def _numeric_values(self, batch, sort_idxs):
+        """Align native bounded5 inputs and archived FP32 scalar targets.
+
+        Bits v1 is a BF16 softsign cue (computed in F64, zero for FP32
+        subnormals/zeros), followed by four unsigned source bytes / 256.
+        The bytes preserve normalized archive bits, not preprocessing losses.
+        Scalar predictions/losses retain FP32 range, rounding and underflow limits.
+        """
+        shape = tuple(sort_idxs.shape)
+        fields = {
+            "number_features": (shape + (5,), torch.bfloat16),
+            "number_target_values": (shape + (1,), torch.float32),
+        }
+        missing = [key for key in fields if key not in batch]
+        if missing:
+            raise ValueError(
+                "bits numeric encoding requires an exact native batch; "
+                f"missing fields: {', '.join(missing)}"
+            )
+        values = {}
+        for key, (expected_shape, expected_dtype) in fields.items():
+            value = batch[key]
+            if tuple(value.shape) != expected_shape or value.dtype != expected_dtype:
+                raise ValueError(
+                    f"{key} must have shape {expected_shape} and dtype "
+                    f"{expected_dtype}; got {tuple(value.shape)} and {value.dtype}"
+                )
+            values[key] = value.gather(1, sort_idxs.unsqueeze(-1).expand_as(value))
+        return values
+
+    def _precision_loss(
+        self, x, type_values, sem_types, is_targets, is_padding, datetime_valid=None
+    ):
         # Count target cells, not padded/invalid slots or output channels.
         masks = is_targets.bool() & ~is_padding
-        masks = masks & ((sem_types != 2) | valid)
+        if self.datetime_encoding == "calendar":
+            masks = masks & ((sem_types != 2) | datetime_valid)
         loss_per_seq = torch.zeros(x.shape[0], dtype=torch.float32, device=x.device)
         yhat_out, sem_type_losses = {}, {}
         for i, t in enumerate(SEM_TYPE_NAMES):
-            if t == "datetime":
-                if self.dec_dict[t].weight.dtype != torch.float32:
+            precise = (t == "datetime" and self.datetime_encoding == "calendar") or (
+                t == "number" and self.numeric_encoding == "bits"
+            )
+            if precise:
+                if any(p.dtype != torch.float32 for p in self.dec_dict[t].parameters()):
                     raise ValueError(
-                        "calendar datetime head must remain FP32; "
+                        f"precision-mode {t} head must remain FP32; "
                         "use model.set_compute_dtype() instead of model.to(dtype)"
                     )
                 with torch.autocast(device_type=x.device.type, enabled=False):
                     yhat = self.dec_dict[t](x.float())
             else:
-                # Numeric/text head execution stays unchanged in this patch.
+                # Heads without an exact input mode retain their compute dtype.
                 yhat = self.dec_dict[t](x)
             yhat_out[t] = yhat
             sem_type_mask = (sem_types == i) & masks
@@ -422,7 +478,9 @@ class RelationalTransformer(nn.Module):
                 target = torch.where(selected, type_values[t].float(), 0.0)
                 if self.loss_fn == "l1":
                     loss_t = F.l1_loss(pred, target, reduction="none").mean(-1)
-                elif self.loss_fn == "huber" or t == "datetime":
+                elif self.loss_fn == "huber" or (
+                    t == "datetime" and self.datetime_encoding == "calendar"
+                ):
                     loss_t = F.huber_loss(pred, target, reduction="none").mean(-1)
                 else:
                     lab = (target > 0).float()
@@ -437,6 +495,12 @@ class RelationalTransformer(nn.Module):
         loss = (loss_per_seq / masks.sum(dim=1).float().clamp_min(1.0)).mean()
         return loss, yhat_out, sem_type_losses, masks
 
+    def _calendar_loss(self, x, type_values, sem_types, is_targets, is_padding, valid):
+        # Retain the existing calendar entry point; all arithmetic is shared.
+        return self._precision_loss(
+            x, type_values, sem_types, is_targets, is_padding, valid
+        )
+
     @classmethod
     def from_pretrained(
         cls,
@@ -450,13 +514,12 @@ class RelationalTransformer(nn.Module):
         config, model_path = resolve_checkpoint(model_id_or_path, revision=revision)
         checkpoint_model = config.get("model", {})
         m = {**checkpoint_model, **model_kwargs}
-        if m.get("datetime_encoding", "scalar") != checkpoint_model.get(
-            "datetime_encoding", "scalar"
-        ):
-            raise ValueError(
-                "datetime_encoding must match the checkpoint; changing the "
-                "representation requires an explicit warm-start transfer"
-            )
+        for key in ("datetime_encoding", "numeric_encoding"):
+            if m.get(key, "scalar") != checkpoint_model.get(key, "scalar"):
+                raise ValueError(
+                    f"{key} must match the checkpoint; changing the "
+                    "representation requires an explicit warm-start transfer"
+                )
         missing = [k for k in MODEL_DIM_KEYS if k not in m]
         if missing:
             raise ValueError(
@@ -464,7 +527,9 @@ class RelationalTransformer(nn.Module):
                 f"provide a config.json or pass them as keyword args."
             )
         state_dict = load_model(
-            model_path, datetime_encoding=m.get("datetime_encoding", "scalar")
+            model_path,
+            datetime_encoding=m.get("datetime_encoding", "scalar"),
+            numeric_encoding=m.get("numeric_encoding", "scalar"),
         )
         model = cls(
             num_blocks=m["num_blocks"],
@@ -480,6 +545,7 @@ class RelationalTransformer(nn.Module):
             ),
             loss_fn=m.get("loss_fn", "huber"),
             datetime_encoding=m.get("datetime_encoding", "scalar"),
+            numeric_encoding=m.get("numeric_encoding", "scalar"),
         )
         model.load_state_dict(state_dict)
         model.config = config
@@ -511,11 +577,16 @@ class RelationalTransformer(nn.Module):
         sem_types = batch["sem_types"].gather(1, sort_idxs)
         is_targets = batch["is_targets"].gather(1, sort_idxs)
         calendar = self.datetime_encoding == "calendar"
+        bits = self.numeric_encoding == "bits"
+        precision_mode = calendar or bits
         datetime = self._calendar_values(batch, sort_idxs) if calendar else None
+        numeric = self._numeric_values(batch, sort_idxs) if bits else None
         type_values = {}
         for t in SEM_TYPE_NAMES:
             if calendar and t == "datetime":
                 type_values[t] = datetime["datetime_target_values"]
+            elif bits and t == "number":
+                type_values[t] = numeric["number_target_values"]
             else:
                 k = t + "_values"
                 type_values[t] = batch[k].gather(1, si.expand_as(batch[k]))
@@ -605,7 +676,7 @@ class RelationalTransformer(nn.Module):
                 is_padding_c,
             )
 
-        if calendar:
+        if precision_mode:
             col_name_values = torch.where(
                 (~is_padding)[..., None], col_name_values, 0.0
             )
@@ -619,11 +690,15 @@ class RelationalTransformer(nn.Module):
             t_values = type_values[t]
             context_mask = (sem_types == i) & ~is_targets & ~is_padding
             target_mask = (sem_types == i) & is_targets & ~is_padding
-            if calendar:
-                if t == "datetime":
+            if precision_mode:
+                if calendar and t == "datetime":
                     context_mask = context_mask & datetime["datetime_valid"]
                     target_mask = target_mask & datetime["datetime_valid"]
                     t_values = datetime["datetime_features"].to(
+                        self.enc_dict[t].weight.dtype
+                    )
+                elif bits and t == "number":
+                    t_values = numeric["number_features"].to(
                         self.enc_dict[t].weight.dtype
                     )
                 t_values = torch.where(context_mask[..., None], t_values, 0.0)
@@ -640,14 +715,14 @@ class RelationalTransformer(nn.Module):
         if return_embeddings:
             return x
 
-        if calendar:
-            return self._calendar_loss(
+        if precision_mode:
+            return self._precision_loss(
                 x,
                 type_values,
                 sem_types,
                 is_targets,
                 is_padding,
-                datetime["datetime_valid"],
+                datetime["datetime_valid"] if calendar else None,
             )
 
         yhat_out = {t: None for t in SEM_TYPE_NAMES}

@@ -96,6 +96,7 @@ def main(
     wandb_entity: str | None,
     out_root: str,
     wandb_disabled: bool,
+    exact_numeric: bool = False,
 ) -> None:
     params = dict(locals())
     grid = [tuple(cfg) for cfg in lcs_bw_pl_grid]
@@ -152,6 +153,9 @@ def main(
     assert checkpoint is not None, "model.load_ckpt_path is required"
     net, config = load_rt_model(checkpoint, device=device, compile=False)
     net = net.set_compute_dtype(torch.bfloat16)
+    exact_numeric = (
+        exact_numeric or getattr(net, "numeric_encoding", "scalar") == "bits"
+    )
     check_embedder(config, embedder, d_text)
     if global_rank == 0:
         log(
@@ -159,6 +163,7 @@ def main(
             embedder=embedder,
             device=device,
             world_size=world_size,
+            exact_numeric=exact_numeric,
         )
     if global_rank == 0 and config.get("task_type") in ("clf", "reg"):
         log(
@@ -202,6 +207,7 @@ def main(
         "world_size": world_size,
         "ddp": ddp,
         "exact_datetime": net.datetime_encoding == "calendar",
+        "exact_numeric": exact_numeric,
     }
     assert "val" not in splits or val_items_per_task is not None, (
         "no val_items_per_task for the val split"
@@ -316,6 +322,7 @@ def build_evaluator(
     world_size=1,
     ddp=False,
     exact_datetime=False,
+    exact_numeric=False,
 ):
     return Evaluator(
         tasks=tasks,
@@ -345,6 +352,7 @@ def build_evaluator(
         ddp=ddp,
         device=device,
         exact_datetime=exact_datetime,
+        exact_numeric=exact_numeric,
     )
 
 
@@ -445,6 +453,10 @@ def run_ensemble(
     ]
     if eval_kwargs.get("exact_datetime", False):
         guard.append("calendar_datetime_v1")
+    if eval_kwargs.get("exact_numeric", False):
+        guard.append("numeric_fp32_truth_v1")
+    if getattr(model, "numeric_encoding", "scalar") == "bits":
+        guard.append("numeric_bits_v1")
     state = {}
     if resume_path.exists():
         state = torch.load(resume_path, weights_only=False)
@@ -556,6 +568,10 @@ def run_ensemble(
                             "best_value": best[db, table]["value"],
                             "task_type": best[db, table]["task_type"],
                             "val_ensemble_size": val_ensemble_size,
+                            "numeric_encoding": getattr(
+                                model, "numeric_encoding", "scalar"
+                            ),
+                            "exact_numeric": eval_kwargs.get("exact_numeric", False),
                             "val_scores": by_cfg,
                         }
                         for (db, table), by_cfg in scores.items()

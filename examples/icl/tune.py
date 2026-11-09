@@ -4,6 +4,7 @@ from pathlib import Path
 
 from examples.icl import env
 from examples.icl.models import model_from_argv
+from examples.icl.run import _check_numeric_state, _numeric_settings
 from examples.icl.tasks import task_list
 from examples.launch import Job, describe, run_sequential
 
@@ -52,11 +53,24 @@ def load_configs(
     return cfgs
 
 
-def jobs(*, ckpt: str, grid_stem: str, task_list: list[tuple[str, str]]) -> list[Job]:
+def jobs(
+    *,
+    ckpt: str,
+    grid_stem: str,
+    task_list: list[tuple[str, str]],
+    exact_numeric: bool = False,
+) -> list[Job]:
+    grid_stem_prefix(grid_stem)
     out_root = env.out_root()
     out = []
+    numeric_settings = None
     for db, table in task_list:
-        if grid_path(grid_stem, db, table).exists():
+        saved_path = grid_path(grid_stem, db, table)
+        if saved_path.exists():
+            if numeric_settings is None:
+                numeric_settings = _numeric_settings(ckpt, exact_numeric)
+            for saved in json.loads(saved_path.read_text()).values():
+                _check_numeric_state(saved, *numeric_settings)
             continue
         run_id = grid_stem.format(db=db, table=table)
         out.append(
@@ -65,6 +79,7 @@ def jobs(*, ckpt: str, grid_stem: str, task_list: list[tuple[str, str]]) -> list
                 target="rt.eval:main",
                 args={
                     "load_ckpt_path": ckpt,
+                    "exact_numeric": exact_numeric,
                     "embedder": "all-MiniLM-L12-v2",
                     "d_text": 384,
                     "num_blocks": 12,

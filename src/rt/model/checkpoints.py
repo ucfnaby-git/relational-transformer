@@ -26,64 +26,89 @@ def save_model(state_dict, path, metadata: dict | None = None) -> None:
     save_file(state_dict, str(path), metadata=meta or None)
 
 
-def _file_datetime_encoding(path):
+def _file_encoding_metadata(path):
     with safe_open(str(path), framework="pt", device="cpu") as checkpoint:
-        return (checkpoint.metadata() or {}).get("datetime_encoding")
+        return checkpoint.metadata() or {}
 
 
-def _datetime_encoding(config_encoding, file_encoding):
+_ENCODING_MODES = {
+    "datetime_encoding": ("scalar", "calendar"),
+    "numeric_encoding": ("scalar", "bits"),
+}
+
+
+def _encoding(name, config_encoding, file_encoding):
     for source, value in (
         ("config", config_encoding),
         ("file metadata", file_encoding),
     ):
-        if value is not None and value not in ("scalar", "calendar"):
-            raise ValueError(
-                f"unknown datetime_encoding {value!r} in checkpoint {source}"
-            )
+        if value is not None and value not in _ENCODING_MODES[name]:
+            raise ValueError(f"unknown {name} {value!r} in checkpoint {source}")
     if (
         config_encoding is not None
         and file_encoding is not None
         and config_encoding != file_encoding
     ):
         raise ValueError(
-            "conflicting datetime_encoding in checkpoint config/request "
+            f"conflicting {name} in checkpoint config/request "
             f"({config_encoding!r}) and file metadata ({file_encoding!r})"
         )
     return config_encoding or file_encoding or "scalar"
 
 
+def validate_precision_state_dict(
+    state_dict, *, datetime_encoding: str = "scalar", numeric_encoding: str = "scalar"
+) -> None:
+    """Validate protected source heads before loading or explicit warm-starting.
+
+    A destination FP32 parameter silently widens narrowed source tensors.
+    Validate source tensors first; scalar heads retain historical dtype acceptance.
+    This does not replace strict key/shape validation by load_state_dict.
+    """
+    for name, mode, head in (
+        ("datetime_encoding", datetime_encoding, "datetime"),
+        ("numeric_encoding", numeric_encoding, "number"),
+    ):
+        _encoding(name, mode, None)
+        if mode == "scalar":
+            continue
+        for key in (f"dec_dict.{head}.weight", f"dec_dict.{head}.bias"):
+            value = state_dict.get(key)
+            if value is None:
+                raise ValueError(f"{mode} checkpoint is missing {key}")
+            if value.dtype != torch.float32:
+                raise ValueError(
+                    f"{mode} checkpoint requires stored FP32 {key}; got {value.dtype}. "
+                    "Widening a narrowed head cannot restore its original precision."
+                )
+
+
 def validate_datetime_state_dict(state_dict, datetime_encoding: str) -> None:
-    """Validate stored calendar-head precision before loading or warm-starting.
+    """Compatibility wrapper for callers validating only the datetime mode."""
+    validate_precision_state_dict(state_dict, datetime_encoding=datetime_encoding)
 
-    A destination FP32 parameter would silently widen a narrowed source tensor.
-    Check the source first; scalar checkpoints retain historical dtype acceptance.
-    This does not replace strict key/shape validation by ``load_state_dict``.
+
+def load_model(
+    path, *, datetime_encoding: str | None = None, numeric_encoding: str | None = None
+):
+    """Load tensors with independent representation and source-head validation.
+
+    Pass both encodings returned by resolve_checkpoint for config-only tags.
+    Missing tags remain scalar; tensor shapes never infer a representation.
     """
-    _datetime_encoding(datetime_encoding, None)
-    if datetime_encoding != "calendar":
-        return
-    for name in ("dec_dict.datetime.weight", "dec_dict.datetime.bias"):
-        value = state_dict.get(name)
-        if value is None:
-            raise ValueError(f"calendar checkpoint is missing {name}")
-        if value.dtype != torch.float32:
-            raise ValueError(
-                f"calendar checkpoint requires stored FP32 {name}; got {value.dtype}. "
-                "Widening a narrowed head cannot restore its original precision."
-            )
-
-
-def load_model(path, *, datetime_encoding: str | None = None):
-    """Load source tensors, validating an explicit or file-tagged representation.
-
-    Pass the encoding returned by ``resolve_checkpoint`` for config-only tags.
-    Completely unmarked checkpoints remain scalar; shapes never infer encoding.
-    """
-    encoding = _datetime_encoding(datetime_encoding, _file_datetime_encoding(path))
+    metadata = _file_encoding_metadata(path)
+    datetime_encoding = _encoding(
+        "datetime_encoding", datetime_encoding, metadata.get("datetime_encoding")
+    )
+    numeric_encoding = _encoding(
+        "numeric_encoding", numeric_encoding, metadata.get("numeric_encoding")
+    )
     sd = load_file(str(path))
     for k in [k for k in sd if ".boolean" in k]:
         del sd[k]
-    validate_datetime_state_dict(sd, encoding)
+    validate_precision_state_dict(
+        sd, datetime_encoding=datetime_encoding, numeric_encoding=numeric_encoding
+    )
     return sd
 
 
@@ -113,10 +138,10 @@ def resolve_checkpoint(spec, *, revision: str | None = None) -> tuple[dict, Path
         config = json.loads((d / CONFIG_FILE).read_text())
         model_path = d / config.get("checkpoint_file", MODEL_FILE)
     _compat(config)
-    file_encoding = _file_datetime_encoding(model_path)
-    encoding = _datetime_encoding(
-        config.get("model", {}).get("datetime_encoding"), file_encoding
-    )
-    if file_encoding is not None:
-        config.setdefault("model", {})["datetime_encoding"] = encoding
+    metadata = _file_encoding_metadata(model_path)
+    for name in _ENCODING_MODES:
+        file_encoding = metadata.get(name)
+        encoding = _encoding(name, config.get("model", {}).get(name), file_encoding)
+        if file_encoding is not None:
+            config.setdefault("model", {})[name] = encoding
     return config, model_path

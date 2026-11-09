@@ -1,8 +1,10 @@
+import json
 import sys
 from pathlib import Path
 
 from examples.icl import env
 from examples.icl.models import model_from_argv
+from examples.icl.run import _check_numeric_state, _numeric_settings
 from examples.icl.tasks import task_list
 from examples.icl.tune import load_configs
 from examples.launch import Job, describe, run_sequential
@@ -19,15 +21,22 @@ def jobs(
     grid_stem: str,
     task_list: list[tuple[str, str]],
     out_subdir: str,
+    exact_numeric: bool = False,
 ) -> list[Job]:
     out_root = env.out_root()
     cfgs = load_configs(configs_path, grid_stem, task_list)
     out = []
+    numeric_settings = None
     for task_key, rec in sorted(cfgs.items()):
         db, table = task_key.split("/")
         for rank, (ctx, lcs, bw, pl) in enumerate(rec["top_cfgs"][:N_CFGS]):
             out_dir = f"{out_root}/{out_subdir}/cfg{rank}"
-            if (Path(out_dir) / f"{db}__{table}.json").exists():
+            saved_path = Path(out_dir) / f"{db}__{table}.json"
+            if saved_path.exists():
+                if numeric_settings is None:
+                    numeric_settings = _numeric_settings(ckpt, exact_numeric)
+                saved = json.loads(saved_path.read_text())
+                _check_numeric_state(saved.get("config", {}), *numeric_settings)
                 continue
             out.append(
                 Job(
@@ -57,6 +66,7 @@ def jobs(
                         "mmap_populate": True,
                         "db_cutoff": None,
                         "ckpt": ckpt,
+                        "exact_numeric": exact_numeric,
                     },
                 )
             )
