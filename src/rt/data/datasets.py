@@ -154,7 +154,6 @@ class RustlerDataset:
                 target_idx = get_column_index(
                     target_column, table_name, db_name, pre_dir
                 )
-                target_column_indices.append(target_idx)
 
                 drop_indices = []
                 for drop_table, col in columns_to_drop:
@@ -166,10 +165,12 @@ class RustlerDataset:
                         )
                     except ValueError:
                         pass
+                cutoff = _resolve_cutoff(db_cutoff, db_name, pre_dir)
+
+                # Append the complete record only after every lookup succeeds.
+                target_column_indices.append(target_idx)
                 drop_column_indices.append(drop_indices)
-
-                cutoff_timestamps.append(_resolve_cutoff(db_cutoff, db_name, pre_dir))
-
+                cutoff_timestamps.append(cutoff)
                 dataset_tuples.append((db_name, table_name, node_idx_offset, num_nodes))
             except Exception as e:
                 if not ignore_data_errors:
