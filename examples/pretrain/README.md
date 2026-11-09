@@ -71,6 +71,16 @@ Calendar `set_compute_dtype` validates the policy when the model is on CUDA.
 For custom setup that moves to CUDA afterward, call
 `rt.model.net.validate_cuda_matmul_precision()` before the first forward.
 
+The trainer uses explicit BF16 compute without an outer autocast context.
+Custom loops combining `torch.compile` with forward-only autocast must also
+configure the compiler's backward autocast assumption. On PyTorch 2.14, use a scoped
+`torch._functorch.config.patch(backward_pass_autocast="off")` around compiled
+forward calls, including lazy compilation, when backward runs outside autocast.
+An inner `autocast(enabled=False)` alone does not establish FP32 compiled
+gradients under a mismatched caller policy. See the
+[PyTorch compiler guidance](https://docs.pytorch.org/docs/2.14/user_guide/torch_compiler/torch.compiler_backward.html).
+On versions without this option, use the trainer's explicit precision schedule.
+
 For a paired experiment, use the same initial FP32 values for every parameter
 whose shape is shared, including the datetime encoder bias. Equal random seeds
 alone do not ensure this: the wider calendar encoder consumes additional random
