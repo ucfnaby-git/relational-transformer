@@ -53,7 +53,7 @@ def _datetime_encoding(config_encoding, file_encoding):
 
 
 def validate_datetime_state_dict(state_dict, datetime_encoding: str) -> None:
-    """Validate stored calendar-head precision before loading or warm-starting.
+    """Validate calendar adapter compatibility and stored head precision.
 
     A destination FP32 parameter would silently widen a narrowed source tensor.
     Check the source first; scalar checkpoints retain historical dtype acceptance.
@@ -62,6 +62,14 @@ def validate_datetime_state_dict(state_dict, datetime_encoding: str) -> None:
     _datetime_encoding(datetime_encoding, None)
     if datetime_encoding != "calendar":
         return
+    adapter = state_dict.get("enc_dict.datetime.weight")
+    if adapter is not None and adapter.ndim == 2 and adapter.shape[1] == 14:
+        raise ValueError(
+            "calendar checkpoint has an obsolete 14-coordinate datetime adapter; "
+            "this model requires 19 coordinates (calendar14 + normalized FP32 "
+            "cue/bytes). Use a new initialization or explicit checkpoint "
+            "migration with fresh optimizer/SWA state; no automatic conversion."
+        )
     for name in ("dec_dict.datetime.weight", "dec_dict.datetime.bias"):
         value = state_dict.get(name)
         if value is None:

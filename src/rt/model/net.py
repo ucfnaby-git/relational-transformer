@@ -14,6 +14,28 @@ allow_ops_in_compiled_graph()
 flex_attention = torch.compile(flex_attention, dynamic=False)
 
 
+def _calendar_context_features(calendar_features, normalized_values, context_mask):
+    """Calendar14, approximate normalized cue, then four exact FP32 bytes.
+
+    Only permitted context contributes. Sanitize before arithmetic/bit views so
+    masked labels, padding and inactive NaNs cannot affect the representation.
+    Bytes are most significant first, scaled by 1/256, and remain exact in BF16.
+    This preserves inputs before projection, not learned embedding injectivity.
+    """
+    selected = context_mask[..., None]
+    calendar = torch.where(selected, calendar_features, 0.0)
+    with torch.autocast(device_type=normalized_values.device.type, enabled=False):
+        z = torch.where(selected, normalized_values, 0.0)
+        bits = z.contiguous().view(torch.int32)
+        # Suppress signed zeros/subnormals before any cue arithmetic; the byte
+        # coordinates retain their bits without depending on floating-point FTZ.
+        normal = (bits & 0x7F800000) != 0
+        coarse_z = torch.where(normal, z, 0.0)
+        cue = (coarse_z / (1.0 + coarse_z.abs())).bfloat16()
+        digits = [((bits >> shift) & 255).bfloat16() / 256 for shift in (24, 16, 8, 0)]
+    return torch.cat([calendar, cue, *digits], dim=-1)
+
+
 def validate_cuda_matmul_precision() -> None:
     """Require IEEE CUDA matmul for FP32 heads without changing global settings.
 
@@ -288,7 +310,7 @@ class RelationalTransformer(nn.Module):
                 "number": nn.Linear(1, d_model, bias=True),
                 "text": nn.Linear(d_text, d_model, bias=True),
                 "datetime": nn.Linear(
-                    14 if datetime_encoding == "calendar" else 1, d_model, bias=True
+                    19 if datetime_encoding == "calendar" else 1, d_model, bias=True
                 ),
                 "col_name": nn.Linear(d_text, d_model, bias=True),
             }
@@ -362,8 +384,9 @@ class RelationalTransformer(nn.Module):
         """Validate the exact-mode interface and align every field with cells.
 
         Source pairs are retained as integers, never used to expose masked
-        labels. Scalar targets come from the sidecar's training normalization;
-        they are FP32 approximations, not exact nanosecond predictions.
+        labels. The normalized FP32 values supply labels and permitted context
+        features; they are not exact nanosecond predictions. Native calendar
+        features stay 14-wide; the model constructs its 19-wide context input.
         """
         shape = tuple(sort_idxs.shape)
         fields = {
@@ -623,9 +646,11 @@ class RelationalTransformer(nn.Module):
                 if t == "datetime":
                     context_mask = context_mask & datetime["datetime_valid"]
                     target_mask = target_mask & datetime["datetime_valid"]
-                    t_values = datetime["datetime_features"].to(
-                        self.enc_dict[t].weight.dtype
-                    )
+                    t_values = _calendar_context_features(
+                        datetime["datetime_features"],
+                        datetime["datetime_target_values"],
+                        context_mask,
+                    ).to(self.enc_dict[t].weight.dtype)
                 t_values = torch.where(context_mask[..., None], t_values, 0.0)
             x = x + (
                 self.norm_dict[t](self.enc_dict[t](t_values)) * context_mask[..., None]
