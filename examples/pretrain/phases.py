@@ -17,6 +17,7 @@ def phase_one(
     eval_num_workers: int,
     total_steps: int,
     early_stop_after_steps: int | None,
+    datetime_encoding: str = "scalar",
 ) -> Job:
     return Job(
         name="phase1-plurel",
@@ -31,6 +32,7 @@ def phase_one(
             "compile": True,
             "materialize_attn_masks": True,
             "loss_fn": "huber",
+            "datetime_encoding": datetime_encoding,
             "load_ckpt_path": None,
             "db_task_list": "data/db-task-lists/rt-plurel-train.json",
             "train_splits": ["train"],
@@ -109,6 +111,7 @@ def phase_two(
     eval_num_workers: int,
     total_steps: int,
     early_stop_after_steps: int | None,
+    datetime_encoding: str = "scalar",
 ) -> Job:
     return Job(
         name="phase2-the-join",
@@ -123,6 +126,7 @@ def phase_two(
             "compile": True,
             "materialize_attn_masks": True,
             "loss_fn": "huber",
+            "datetime_encoding": datetime_encoding,
             "load_ckpt_path": load_ckpt_path,
             "db_task_list": "data/db-task-lists/rt-j.json",
             "train_splits": ["train"],
@@ -203,7 +207,9 @@ def jobs(
     eval_num_workers: int,
     total_steps: int,
     early_stop_after_steps: int | None,
+    datetime_encoding: str = "scalar",
 ) -> list[Job]:
+    """Use scalar for pinned legacy archives; opt both phases into calendar explicitly."""
     return [
         phase_one(
             pre_dir=plurel_pre_dir,
@@ -218,6 +224,7 @@ def jobs(
             eval_num_workers=eval_num_workers,
             total_steps=total_steps,
             early_stop_after_steps=early_stop_after_steps,
+            datetime_encoding=datetime_encoding,
         ),
         phase_two(
             load_ckpt_path=phase_two_load_ckpt_path,
@@ -233,6 +240,7 @@ def jobs(
             eval_num_workers=eval_num_workers,
             total_steps=total_steps,
             early_stop_after_steps=early_stop_after_steps,
+            datetime_encoding=datetime_encoding,
         ),
     ]
 

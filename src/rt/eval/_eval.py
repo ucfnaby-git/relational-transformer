@@ -151,7 +151,7 @@ def main(
     checkpoint = load_ckpt_path
     assert checkpoint is not None, "model.load_ckpt_path is required"
     net, config = load_rt_model(checkpoint, device=device, compile=False)
-    net = net.to(torch.bfloat16)
+    net = net.set_compute_dtype(torch.bfloat16)
     check_embedder(config, embedder, d_text)
     if global_rank == 0:
         log(
@@ -201,6 +201,7 @@ def main(
         "local_rank": local_rank,
         "world_size": world_size,
         "ddp": ddp,
+        "exact_datetime": net.datetime_encoding == "calendar",
     }
     assert "val" not in splits or val_items_per_task is not None, (
         "no val_items_per_task for the val split"
@@ -314,6 +315,7 @@ def build_evaluator(
     local_rank=0,
     world_size=1,
     ddp=False,
+    exact_datetime=False,
 ):
     return Evaluator(
         tasks=tasks,
@@ -342,6 +344,7 @@ def build_evaluator(
         world_size=world_size,
         ddp=ddp,
         device=device,
+        exact_datetime=exact_datetime,
     )
 
 
@@ -440,6 +443,8 @@ def run_ensemble(
         eval_kwargs["shuffle_seed"],
         eval_kwargs["db_cutoff"],
     ]
+    if eval_kwargs.get("exact_datetime", False):
+        guard.append("calendar_datetime_v1")
     state = {}
     if resume_path.exists():
         state = torch.load(resume_path, weights_only=False)

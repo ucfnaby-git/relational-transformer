@@ -57,6 +57,7 @@ def process_batch(tup, d_text):
         if k in [
             "number_values",
             "datetime_values",
+            "datetime_features",
             "text_values",
             "col_name_values",
         ]:
@@ -81,6 +82,14 @@ def process_batch(tup, d_text):
     out["datetime_values"] = out["datetime_values"].view(-1, seq_len, 1)
     out["text_values"] = out["text_values"].view(-1, seq_len, d_text)
     out["col_name_values"] = out["col_name_values"].view(-1, seq_len, d_text)
+
+    if "datetime_features" in out:
+        out["datetime_features"] = out["datetime_features"].view(-1, seq_len, 14)
+        out["datetime_target_values"] = out["datetime_target_values"].view(
+            -1, seq_len, 1
+        )
+        for key in ("datetime_seconds", "datetime_nanoseconds", "datetime_valid"):
+            out[key] = out[key].view(-1, seq_len)
 
     return out
 
@@ -111,6 +120,7 @@ class RustlerDataset:
         timeout_per_item,
         vector_db_path: str | None,
         db_cutoff: str | int | None,
+        exact_datetime: bool = False,
     ):
         pre_dir = resolve_pre_dir(pre_dir)
         if vector_db_path is not None:
@@ -214,6 +224,7 @@ class RustlerDataset:
             legacy_boolean=legacy_boolean,
             timeout_per_item=timeout_per_item,
             vector_db_path=vector_db_path,
+            **({"exact_datetime": True} if exact_datetime else {}),
         )
         self.num_items = self.sampler.num_items
 
@@ -250,6 +261,7 @@ class TrainDataset(RustlerDataset, IterableDataset):
         vector_db_path: str | None,
         db_cutoff: str | int | None,
         start_step: int = 0,
+        exact_datetime: bool = False,
     ):
         RustlerDataset.__init__(
             self,
@@ -276,6 +288,7 @@ class TrainDataset(RustlerDataset, IterableDataset):
             timeout_per_item=timeout_per_item,
             vector_db_path=vector_db_path,
             db_cutoff=db_cutoff,
+            exact_datetime=exact_datetime,
         )
         self.train_ctx_size_list = train_ctx_size_list
         self.seed = random.Random(seed).getrandbits(64)

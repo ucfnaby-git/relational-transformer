@@ -38,6 +38,7 @@ class Evaluator:
         world_size,
         ddp,
         device,
+        exact_datetime=False,
     ):
         self.tasks = [t for t in tasks if "synthetic" not in t.db_name]
         self.eval_splits = sorted({t.split for t in self.tasks if t.split})
@@ -84,6 +85,7 @@ class Evaluator:
                 timeout_per_item=3600.0,
                 vector_db_path=vector_db_path,
                 db_cutoff=db_cutoff,
+                exact_datetime=exact_datetime,
             )
             total_items += rustler_dataset.num_items
             eval_dataset = EvalDataset(
@@ -171,6 +173,16 @@ class Evaluator:
                     t_load += time.perf_counter() - _t
 
                     batch_mask = batch.pop("batch_mask")
+                    datetime_targets = (
+                        batch["is_targets"]
+                        & ~batch["is_padding"]
+                        & (batch["sem_types"] == 2)
+                    )
+                    if datetime_targets.any():
+                        raise ValueError(
+                            "Task evaluation predicts numeric targets; datetime "
+                            "targets are only supported by reconstruction loss."
+                        )
 
                     for eval_ctx_size in eval_ctx_size_list_to_use:
                         tb = {k: v[:, :eval_ctx_size] for k, v in batch.items()}

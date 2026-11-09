@@ -44,6 +44,39 @@ list of `[db, task]` pairs; `rt.data.make_db_task_list(pre_dir, kinds)` enumerat
 a directory and `rt.data.make_plurel_db_task_list` applies the PluRel filter.
 Lower `total_steps` and `tokens_per_gpu` for a smaller budget.
 
+For exact calendar context, prepare the [datetime sidecars](../preprocess/README.md#exact-datetime-inputs)
+for both training and validation databases, then pass
+`datetime_encoding="calendar"` to the phase recipe or `rt.train.main`.
+Use a fresh run and staging directory. Phase 2 must load a calendar checkpoint
+from phase 1; a released scalar checkpoint is not an interchangeable input
+adapter. The default scalar mode retains compatibility with released data and
+checkpoints. Direct `rt.train.main` calls inherit the checkpoint's encoding when
+`datetime_encoding` is omitted or `None`. The phase recipe defaults to scalar;
+pass `datetime_encoding="calendar"` explicitly for calendar warm starts.
+
+Calendar mode keeps the Transformer in BF16 and the datetime output head/loss
+arithmetic in FP32. For direct inference, use
+`model.set_compute_dtype(torch.bfloat16)` after loading, and pass
+`exact_datetime=model.datetime_encoding == "calendar"` to `build_evaluator`.
+A blanket `model.to(torch.bfloat16)` also narrows the FP32 head. The scalar
+datetime reconstruction target still has FP32 resolution; calendar components
+are context features, not separate prediction labels.
+
+FP32 heads also require IEEE CUDA matmul precision: disabling autocast alone
+does not disable TF32. Configure the policy before compilation and keep it fixed
+through forward/backward. Use `torch.backends.cuda.matmul.fp32_precision="ieee"`
+when that API is available, or the older
+`torch.set_float32_matmul_precision("highest")`; do not mix the two APIs.
+Calendar `set_compute_dtype` validates the policy when the model is on CUDA.
+For custom setup that moves to CUDA afterward, call
+`rt.model.net.validate_cuda_matmul_precision()` before the first forward.
+
+For a paired experiment, use the same initial FP32 values for every parameter
+whose shape is shared, including the datetime encoder bias. Equal random seeds
+alone do not ensure this: the wider calendar encoder consumes additional random
+draws. Both arms should use the same trainer, which captures FP32 master weights
+before narrowing the live model and synchronizes those masters across ranks.
+
 ## Outputs
 
 Each run writes `<out_root>/<entity>/<project>/<run_id>/`:

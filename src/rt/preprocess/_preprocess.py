@@ -48,10 +48,61 @@ def dataset_name(dataset_dir: Path) -> str:
 
 
 def run_rustler_pre(
-    dataset_dir: Path, out_dir: Path, source: str, skip_tasks: bool
+    dataset_dir: Path,
+    out_dir: Path,
+    source: str,
+    skip_tasks: bool,
+    exact_datetime: bool = False,
 ) -> None:
     print(f"+ preprocess {dataset_dir} -> {out_dir}", flush=True)
-    preprocess(str(dataset_dir), str(out_dir), source=source, skip_tasks=skip_tasks)
+    preprocess(
+        str(dataset_dir),
+        str(out_dir),
+        source=source,
+        skip_tasks=skip_tasks,
+        **({"exact_datetime": True} if exact_datetime else {}),
+    )
+
+
+def backfill_datetime(
+    *,
+    dataset: str,
+    pre_dir: str,
+    revision: str | None = None,
+    source_receipt: str | None = None,
+) -> Path:
+    """Add exact datetime data from the original, row-aligned raw database.
+
+    Existing archives and text embeddings are not regenerated. ``pre_dir``
+    may name the preprocessed database itself or its parent collection. Historical
+    archives require an independently trusted source/archive receipt; current raw
+    hashes alone cannot establish their original row order or timestamp precision.
+    """
+    from rt.rustler import backfill_datetime as build_sidecar
+
+    raw_dir = resolve_dataset_dir(dataset, revision=revision)
+    pre_dataset_dir = Path(pre_dir).expanduser()
+    if not (pre_dataset_dir / "meta.json").is_file():
+        pre_dataset_dir = pre_dataset_dir / dataset_name(raw_dir)
+    build_sidecar(
+        str(raw_dir),
+        str(pre_dataset_dir),
+        source_receipt=(
+            str(Path(source_receipt).expanduser()) if source_receipt else None
+        ),
+    )
+    return pre_dataset_dir
+
+
+def validate_datetime(*, pre_dir: str) -> None:
+    """Verify a sidecar's bound content and refresh local file timestamps.
+
+    Run once after copying/downloading a preprocessed database. This allows
+    subsequent sampler workers to use fast identity checks without rehashing it.
+    """
+    from rt.rustler import validate_datetime as validate_sidecar
+
+    validate_sidecar(str(Path(pre_dir).expanduser()))
 
 
 def embed_dataset(pre_dataset_dir: Path, embedder: str, batch_size: int) -> int:
@@ -133,13 +184,20 @@ def preprocess_one(
     upload_repo: str | None,
     private: bool,
     revision: str | None,
+    exact_datetime: bool = False,
 ) -> Path:
     dataset_dir = resolve_dataset_dir(spec, revision=revision)
     name = dataset_name(dataset_dir)
     pre_dataset_dir = out_dir / name
     print(f"=== preprocessing {name} ({spec}) -> {pre_dataset_dir} ===", flush=True)
 
-    run_rustler_pre(dataset_dir, out_dir, source=spec, skip_tasks=skip_tasks)
+    run_rustler_pre(
+        dataset_dir,
+        out_dir,
+        source=spec,
+        skip_tasks=skip_tasks,
+        exact_datetime=exact_datetime,
+    )
     if embed:
         d_text = embed_dataset(pre_dataset_dir, embedder, batch_size)
         update_meta_with_embeddings(pre_dataset_dir, embedder, d_text)
@@ -172,6 +230,7 @@ def one(
     upload_repo: str | None,
     public: bool,
     revision: str | None,
+    exact_datetime: bool = False,
 ) -> None:
     preprocess_one(
         dataset,
@@ -183,6 +242,7 @@ def one(
         upload_repo=upload_repo,
         private=not public,
         revision=revision,
+        exact_datetime=exact_datetime,
     )
 
 
@@ -200,6 +260,7 @@ def many(
     upload_repo: str | None,
     public: bool,
     revision: str | None,
+    exact_datetime: bool = False,
 ) -> None:
     specs = list_datasets(repo, revision=revision)
     assert 0 <= shard < num_shards, (
@@ -214,11 +275,13 @@ def many(
     failures = []
     for i, spec in enumerate(shard):
         name = spec.rsplit("/", 1)[-1]
-        if skip_existing and _embeddings_done(out_dir / name):
-            print(f"[{i + 1}/{len(shard)}] skip existing {name}", flush=True)
-            continue
-        print(f"[{i + 1}/{len(shard)}] {spec}", flush=True)
         try:
+            if skip_existing and _embeddings_done(out_dir / name):
+                if exact_datetime:
+                    validate_datetime(pre_dir=str(out_dir / name))
+                print(f"[{i + 1}/{len(shard)}] skip existing {name}", flush=True)
+                continue
+            print(f"[{i + 1}/{len(shard)}] {spec}", flush=True)
             preprocess_one(
                 spec,
                 out_dir,
@@ -229,6 +292,7 @@ def many(
                 upload_repo=upload_repo,
                 private=not public,
                 revision=revision,
+                exact_datetime=exact_datetime,
             )
         except Exception as e:  # noqa: BLE001
             print(

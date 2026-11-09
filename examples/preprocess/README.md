@@ -74,3 +74,57 @@ one(dataset="stanford-star/relbench-v1/rel-f1", out_dir="data/relbench-preproces
 rustler; `upload_repo` pushes the result to the Hub. `rt.preprocess.many`
 takes a Hub repo of databases and does shard `shard` of `num_shards`, skipping
 finished ones; `rt.preprocess.ls` lists the repo.
+
+## Exact datetime inputs
+
+The released archives contain normalized FP32 datetime scalars. Calendar
+encoding needs the original timestamps; widening those scalars cannot recover
+them. For a new database, pass `exact_datetime=True` to `one` or
+`preprocess_one`. Preprocessing records the raw input identities before and
+after building the archive, then writes the exact datetime sidecar.
+
+Backfilling a historical archive requires an independently trusted receipt
+binding its original raw source and archive identities:
+
+```python
+from rt.preprocess import backfill_datetime
+
+backfill_datetime(
+    dataset="data/my-collection/my-db",
+    pre_dir="data/my-collection-preprocessed/my-db",
+    source_receipt="data/verified-source-receipt.json",
+)
+```
+
+This CPU operation adds `datetime_source.json`, `datetime_exact.bin`, and
+`datetime_exact.json` without rebuilding the graph or text embeddings. It verifies the receipt and structural
+mapping. Matching row counts, foreign keys, or a lossy preprocessing replay
+cannot prove the original raw timestamps. Without trusted source provenance,
+preprocess the raw database into a new directory instead. A receipt created by
+fresh exact preprocessing is reused automatically when `source_receipt` is omitted.
+The [sidecar format and receipt contract](datetime.md) describe the required
+identities and the limits of historical source verification.
+
+After copying or downloading an exact database, verify its content once:
+
+```python
+from rt.preprocess import validate_datetime
+
+validate_datetime(pre_dir="data/my-collection-preprocessed/my-db")
+```
+
+Validation refreshes local file timestamps after checking content identities,
+so sampler workers can perform fast checks. Bulk `many(..., skip_existing=True,
+exact_datetime=True)` also validates before reusing a database.
+
+The sidecar stores integer Unix seconds and a nanosecond remainder, preserving
+coarse-unit dates beyond the int64-nanosecond range. Calendar features comprise
+three year limbs, month/day/hour/minute/second, and two limbs each for
+milliseconds/microseconds/nanoseconds. Their power-of-two scaling is exact in
+BF16. Calendar values outside Chrono's supported range are rejected. Naive
+datetimes use the existing UTC convention; source nulls remain absent cells.
+
+The sidecar also records training-only datetime normalization for the scalar
+FP32 reconstruction target. This target and learned predictions remain
+approximate; exact features do not imply nanosecond prediction resolution.
+Existing row-time filtering is unchanged.

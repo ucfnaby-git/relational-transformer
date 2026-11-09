@@ -48,7 +48,7 @@ def main(
 
     (task,) = get_tasks(pre_dir, [(db, table)], (split,))
     model, config = load_rt_model(ckpt, device=device, compile=device == "cuda")
-    model = model.to(torch.bfloat16)
+    model = model.set_compute_dtype(torch.bfloat16)
 
     curve: dict[str, float] = {}
     sum_preds = labels0 = nodes0 = None
@@ -82,6 +82,7 @@ def main(
             mmap_populate=mmap_populate,
             vector_db_path=None,
             db_cutoff=db_cutoff,
+            exact_datetime=model.datetime_encoding == "calendar",
         )
         ((_t, _ctx, labels, preds_by_prefix, _nl, node_idxs),) = list(
             ev.evaluate_raw([(model, "")], [ctx_size], with_node_idxs=True)

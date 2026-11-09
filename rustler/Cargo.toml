@@ -36,7 +36,7 @@ polars = { version = "0.46", features = [
 ] }
 chrono = "0.4"
 serde_yaml = "0.9"
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 glob = "0.3"
 itertools = "0.14"
 serde = { version = "1.0", features = ["derive"] }
@@ -44,6 +44,7 @@ rand = "0.9.1"
 clap = { version = "4.5", features = ["derive"] }
 pyo3 = { version = "0.24", features = ["abi3-py310"] }
 memmap2 = "0.9"
+sha2 = "0.10"
 rkyv = { version = "0.8", features = ["pointer_width_64"] }
 # Must track pyo3's major: numpy 0.24 is the release built against pyo3 0.24,
 # and a mismatch is a type error on every `PyArray` boundary.

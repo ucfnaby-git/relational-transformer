@@ -112,6 +112,39 @@ def eval_avg_metrics(evaluators, nets_with_prefix, ctx_size_list):
     }
 
 
+def _resolve_datetime_encoding(requested, checkpoint_encoding=None):
+    encoding = requested if requested is not None else checkpoint_encoding or "scalar"
+    if encoding not in ("scalar", "calendar"):
+        raise ValueError(f"unknown datetime_encoding={encoding!r}")
+    if checkpoint_encoding is not None and encoding != checkpoint_encoding:
+        raise ValueError(
+            f"datetime_encoding={encoding!r} does not match checkpoint "
+            f"datetime_encoding={checkpoint_encoding!r}; use a same-schema checkpoint "
+            "or explicitly migrate it into a new run (reset optimizer and SWA state)"
+        )
+    return encoding
+
+
+@torch.no_grad()
+def _init_master_params(net, state=None, *, ddp=False):
+    named = dict(net.named_parameters())
+    if state is not None and state.keys() != named.keys():
+        raise ValueError("resume master parameter names do not match the model")
+    master = {}
+    for name, p in named.items():
+        source = p if state is None else state[name]
+        if source.shape != p.shape or source.dtype != torch.float32:
+            raise ValueError(
+                f"{name}: expected FP32 master with shape {tuple(p.shape)}, "
+                f"got {source.dtype} with shape {tuple(source.shape)}"
+            )
+        t = source.detach().to(device=p.device).clone().requires_grad_(True)
+        if ddp:
+            dist.broadcast(t, src=0)
+        master[name] = t
+    return master
+
+
 def main(
     *,
     embedder: str,
@@ -123,6 +156,7 @@ def main(
     compile: bool,
     materialize_attn_masks: bool,
     loss_fn: str,
+    datetime_encoding: str | None = None,
     load_ckpt_path: str | None,
     db_task_list: list[tuple[str, str]] | str,
     train_splits: list[str],
@@ -208,6 +242,42 @@ def main(
 
     device, rank, local_rank, world_size, ddp = setup_dist(num_workers)
     is_main = rank == 0
+    out_dir = Path(out_root).expanduser() / run_subdir(wandb_entity, project, run_id)
+    resume_path = out_dir / "resume.pt"
+    resume = (
+        torch.load(resume_path, map_location="cpu", weights_only=True)
+        if resume_path.exists()
+        else None
+    )
+    checkpoint_config, ckpt_path = {}, None
+    if load_ckpt_path is not None and (resume is None or delta_finetune):
+        checkpoint_config, ckpt_path = resolve_checkpoint(load_ckpt_path)
+    checkpoint_encoding = (
+        resume.get("datetime_encoding", "scalar")
+        if resume is not None
+        else checkpoint_config.get("model", {}).get("datetime_encoding", "scalar")
+        if ckpt_path is not None
+        else None
+    )
+    datetime_encoding = _resolve_datetime_encoding(
+        datetime_encoding, checkpoint_encoding
+    )
+    if delta_finetune and ckpt_path is not None:
+        _resolve_datetime_encoding(
+            datetime_encoding,
+            checkpoint_config.get("model", {}).get("datetime_encoding", "scalar"),
+        )
+    params["datetime_encoding"] = datetime_encoding
+    if is_main:
+        log(
+            datetime_encoding=datetime_encoding,
+            master_initialization="fp32_before_compute_cast",
+            resume_master_initialization=(
+                resume.get("master_initialization", "legacy_bf16_before_master")
+                if resume is not None
+                else "-"
+            ),
+        )
 
     if stage_dir is not None:
         pre_dir, eval_pre_dir = stage_paths(
@@ -248,7 +318,6 @@ def main(
         wandb.define_metric("*", step_metric="step")
 
     seed_everything(seed + rank)
-    out_dir = Path(out_root).expanduser() / run_subdir(wandb_entity, project, run_id)
     if is_main:
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "params.json").write_text(
@@ -257,40 +326,43 @@ def main(
         log(out_dir=out_dir)
 
     def build_net():
-        return (
-            RelationalTransformer(
-                num_blocks=num_blocks,
-                d_model=d_model,
-                d_text=d_text,
-                num_heads=num_heads,
-                d_ff=d_ff,
-                compile=compile,
-                materialize_attn_masks=materialize_attn_masks,
-                loss_fn=loss_fn,
-            )
-            .to(device)
-            .to(torch.bfloat16)
-        )
+        return RelationalTransformer(
+            num_blocks=num_blocks,
+            d_model=d_model,
+            d_text=d_text,
+            num_heads=num_heads,
+            d_ff=d_ff,
+            compile=compile,
+            materialize_attn_masks=materialize_attn_masks,
+            loss_fn=loss_fn,
+            datetime_encoding=datetime_encoding,
+        ).to(device=device, dtype=torch.float32)
 
     net = build_net()
     raw_net = net
+    if resume is not None and "master" not in resume:
+        raise ValueError(f"{resume_path} carries no FP32 master weights; cannot resume")
+    if resume is None and ckpt_path is not None:
+        raw_net.load_state_dict(
+            load_model(ckpt_path, datetime_encoding=datetime_encoding), strict=True
+        )
+        if is_main:
+            log(warm_started_from=load_ckpt_path)
+    # Capture authoritative FP32 values before narrowing the live model. Detached
+    # masters are outside DDP, so synchronize them before live/SWA copies exist.
+    master = _init_master_params(
+        raw_net, None if resume is None else resume["master"], ddp=ddp
+    )
+    raw_net.set_compute_dtype(torch.bfloat16)
     if is_main:
         log(params=f"{sum(p.numel() for p in net.parameters()):_}")
-
-    master = {
-        n: p.detach().float().clone().requires_grad_(True)
-        for n, p in raw_net.named_parameters()
-    }
-
-    @torch.no_grad()
-    def net_to_master():
-        for n, p in raw_net.named_parameters():
-            master[n].copy_(p)
 
     @torch.no_grad()
     def master_to_net():
         for n, p in raw_net.named_parameters():
             p.copy_(master[n])
+
+    master_to_net()
 
     def _is_muon(name, p):
         if p.ndim != 2 or min(p.shape) == 1:
@@ -371,40 +443,26 @@ def main(
     start_step = 0
     resume_evaled_at = None
 
-    resume_path = out_dir / "resume.pt"
-    if load_ckpt_path is not None and not resume_path.exists():
-        _, ckpt_path = resolve_checkpoint(load_ckpt_path)
-        raw_net.load_state_dict(load_model(ckpt_path))
-        net_to_master()
-        if is_main:
-            log(warm_started_from=load_ckpt_path)
-
     swa = (
         None
         if swa_momentum is None
         else SwaState(master.items(), momentum=swa_momentum)
     )
     swa_net = None if swa is None else build_net()
+    if swa_net is not None:
+        swa_net.set_compute_dtype(torch.bfloat16)
 
     delta_base = None
     if delta_finetune:
-        _, base_path = resolve_checkpoint(load_ckpt_path)
-        base_sd = load_model(base_path)
+        base_sd = load_model(ckpt_path, datetime_encoding=datetime_encoding)
         delta_base = {
             n: base_sd[n].to(p.device, torch.float32)
             for n, p in master.items()
             if _is_decayed(n, p)
         }
 
-    if resume_path.exists():
-        ck = torch.load(resume_path, map_location="cpu", weights_only=True)
-        assert "master" in ck, (
-            f"{resume_path} carries no fp32 master weights; it predates them "
-            "and cannot be resumed"
-        )
-        for n, t in master.items():
-            t.data.copy_(ck["master"][n])
-        master_to_net()
+    if resume is not None:
+        ck = resume
         for o, sd in zip(opts, ck["optimizers"], strict=True):
             o.load_state_dict(sd)
         for s, sd in zip(scheds, ck["schedulers"], strict=True):
@@ -434,6 +492,10 @@ def main(
                 world_size=world_size,
             )
 
+    if swa is not None:
+        swa.sync_to(swa_net.named_parameters())
+    del resume
+
     data_seed = seed
     train_init_tic = time.time()
     train_tasks = get_tasks(pre_dir, db_task_list, tuple(train_splits))
@@ -462,6 +524,7 @@ def main(
         timeout_per_item=timeout_per_item,
         vector_db_path=vector_db_path,
         db_cutoff=db_cutoff,
+        exact_datetime=datetime_encoding == "calendar",
     )
     total_items = total_steps * total_bs
     stream_items = train_ds.num_items
@@ -564,6 +627,7 @@ def main(
                         world_size=world_size,
                         ddp=ddp,
                         device=device,
+                        exact_datetime=datetime_encoding == "calendar",
                     )
                     for member in range(eval_ensemble_size)
                 ],
@@ -598,6 +662,7 @@ def main(
                         "d_ff": d_ff,
                         "materialize_attn_masks": materialize_attn_masks,
                         "loss_fn": loss_fn,
+                        "datetime_encoding": datetime_encoding,
                     },
                 },
                 indent=2,
@@ -613,6 +678,8 @@ def main(
             with open(tmp, "wb") as f:
                 torch.save(
                     {
+                        "datetime_encoding": datetime_encoding,
+                        "master_initialization": "fp32_before_compute_cast",
                         "master": {n: t.detach().cpu() for n, t in master.items()},
                         "optimizers": [o.state_dict() for o in opts],
                         "schedulers": [s.state_dict() for s in scheds],
@@ -646,7 +713,11 @@ def main(
         if not is_main:
             return
         live = out_dir / f"steps={step}.safetensors"
-        save_model(raw_net.state_dict(), live, metadata={"step": step})
+        save_model(
+            raw_net.state_dict(),
+            live,
+            metadata={"step": step, "datetime_encoding": datetime_encoding},
+        )
         publish_latest(live, "latest.safetensors")
         if swa is not None and swa.n > 0:
             swa.sync_to(swa_net.named_parameters())
@@ -654,7 +725,11 @@ def main(
             save_model(
                 swa_net.state_dict(),
                 swa_ckpt,
-                metadata={"step": step, "swa_n": swa.n},
+                metadata={
+                    "step": step,
+                    "swa_n": swa.n,
+                    "datetime_encoding": datetime_encoding,
+                },
             )
             publish_latest(swa_ckpt, "latest_swa.safetensors")
 

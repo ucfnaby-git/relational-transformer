@@ -1,3 +1,6 @@
+#[path = "datetime.rs"]
+pub(crate) mod datetime;
+
 use crate::common::{
     ArchivedAdj, ArchivedEdge, ArchivedNode, ArchivedOffsets, ArchivedSemType, ArchivedTableType,
     Offsets, SemType, TableInfo,
@@ -30,8 +33,8 @@ use std::io::{BufReader, Read};
 use std::str;
 #[cfg(feature = "vecdb")]
 use std::sync::Mutex;
-use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 unsafe fn alloc_zeroed_vec<T>(len: usize) -> Vec<T> {
@@ -98,7 +101,65 @@ const DEADLINE_CHECK_EVERY: usize = 1024;
 
 const DRAW_BUDGET: usize = 2;
 
+struct ExactVecs {
+    features: Vec<bf16>,
+    seconds: Vec<i64>,
+    nanoseconds: Vec<i32>,
+    valid: Vec<bool>,
+    target_values: Vec<f32>,
+}
+
+struct ExactSlices<'a> {
+    features: &'a mut [bf16],
+    seconds: &'a mut [i64],
+    nanoseconds: &'a mut [i32],
+    valid: &'a mut [bool],
+    target_values: &'a mut [f32],
+}
+
+impl ExactVecs {
+    fn new(len: usize) -> Self {
+        Self {
+            features: vec![bf16::ZERO; len * datetime::FEATURES],
+            seconds: vec![0; len],
+            nanoseconds: vec![0; len],
+            valid: vec![false; len],
+            target_values: vec![0.0; len],
+        }
+    }
+
+    fn chunks_exact_mut(&mut self, len: usize) -> impl Iterator<Item = ExactSlices<'_>> {
+        izip!(
+            self.features.chunks_exact_mut(len * datetime::FEATURES),
+            self.seconds.chunks_exact_mut(len),
+            self.nanoseconds.chunks_exact_mut(len),
+            self.valid.chunks_exact_mut(len),
+            self.target_values.chunks_exact_mut(len),
+        )
+        .map(
+            |(features, seconds, nanoseconds, valid, target_values)| ExactSlices {
+                features,
+                seconds,
+                nanoseconds,
+                valid,
+                target_values,
+            },
+        )
+    }
+}
+
+impl ExactSlices<'_> {
+    fn clear(&mut self) {
+        self.features.fill(bf16::ZERO);
+        self.seconds.fill(0);
+        self.nanoseconds.fill(0);
+        self.valid.fill(false);
+        self.target_values.fill(0.0);
+    }
+}
+
 struct Vecs {
+    exact: Option<ExactVecs>,
     node_idxs: Vec<i32>,
     f2p_nbr_idxs: Vec<i32>,
     table_name_idxs: Vec<i32>,
@@ -122,6 +183,7 @@ struct Vecs {
 }
 
 struct Slices<'a> {
+    exact: Option<ExactSlices<'a>>,
     node_idxs: &'a mut [i32],
     f2p_nbr_idxs: &'a mut [i32],
     table_name_idxs: &'a mut [i32],
@@ -141,9 +203,10 @@ struct Slices<'a> {
 }
 
 impl Vecs {
-    fn new(bs: usize, seq_len: usize, d_text: usize) -> Self {
+    fn new(bs: usize, seq_len: usize, d_text: usize, exact_datetime: bool) -> Self {
         let l = bs * seq_len;
         Self {
+            exact: exact_datetime.then(|| ExactVecs::new(l)),
             node_idxs: vec![-1; l],
             f2p_nbr_idxs: vec![-1; l * MAX_F2P_NBRS],
             table_name_idxs: vec![0; l],
@@ -171,6 +234,13 @@ impl Vecs {
         seq_len: usize,
         d_text: usize,
     ) -> impl Iterator<Item = Slices<'_>> {
+        let exact = self
+            .exact
+            .as_mut()
+            .into_iter()
+            .flat_map(move |v| v.chunks_exact_mut(seq_len))
+            .map(Some)
+            .chain(std::iter::repeat_with(|| None));
         izip!(
             self.node_idxs.chunks_exact_mut(seq_len),
             self.f2p_nbr_idxs.chunks_exact_mut(seq_len * MAX_F2P_NBRS),
@@ -187,7 +257,8 @@ impl Vecs {
             self.is_padding.chunks_exact_mut(seq_len),
             self.timestamps.chunks_exact_mut(seq_len),
             self.seed_node_idxs.chunks_exact_mut(seq_len),
-            self.bfs_depths.chunks_exact_mut(seq_len)
+            self.bfs_depths.chunks_exact_mut(seq_len),
+            exact
         )
         .map(
             |(
@@ -207,7 +278,9 @@ impl Vecs {
                 timestamps,
                 seed_node_idxs,
                 bfs_depths,
+                exact,
             )| Slices {
+                exact,
                 node_idxs,
                 f2p_nbr_idxs,
                 table_name_idxs,
@@ -228,7 +301,7 @@ impl Vecs {
         )
     }
     fn into_pyobject<'a>(self, py: Python<'a>) -> PyResult<Vec<PyObject>> {
-        Ok(vec![
+        let mut fields = vec![
             ("node_idxs", PyArray1::from_vec(py, self.node_idxs))
                 .into_py_any(py)
                 .unwrap(),
@@ -296,7 +369,25 @@ impl Vecs {
                 .into_py_any(py)
                 .unwrap(),
             ("seq_len", self.seq_len).into_py_any(py).unwrap(),
-        ])
+        ];
+        if let Some(exact) = self.exact {
+            fields.extend([
+                ("datetime_features", PyArray1::from_vec(py, exact.features)).into_py_any(py)?,
+                ("datetime_seconds", PyArray1::from_vec(py, exact.seconds)).into_py_any(py)?,
+                (
+                    "datetime_nanoseconds",
+                    PyArray1::from_vec(py, exact.nanoseconds),
+                )
+                    .into_py_any(py)?,
+                ("datetime_valid", PyArray1::from_vec(py, exact.valid)).into_py_any(py)?,
+                (
+                    "datetime_target_values",
+                    PyArray1::from_vec(py, exact.target_values),
+                )
+                    .into_py_any(py)?,
+            ]);
+        }
+        Ok(fields)
     }
 }
 
@@ -315,6 +406,7 @@ unsafe impl Send for VectorDbEntry {}
 unsafe impl Sync for VectorDbEntry {}
 
 struct Dataset {
+    datetime: Option<Arc<datetime::Sidecar>>,
     mmap: Mmap,
     text_mmap: Mmap,
     p2f_adj_mmap: Mmap,
@@ -333,6 +425,7 @@ struct Item {
 
 #[pyclass]
 pub struct Sampler {
+    exact_datetime: bool,
     global_rank: usize,
     local_rank: usize,
     world_size: usize,
@@ -374,6 +467,13 @@ pub struct Sampler {
 #[pymethods]
 impl Sampler {
     #[new]
+    #[pyo3(signature = (dataset_tuples, global_rank, local_rank, world_size,
+        local_ctx_size_list, bfs_width_list, num_walks, walk_length,
+        prefer_latest_list, mask_prob_max, embedder, pre_dir, d_text,
+        shuffle_seed, context_seed, target_columns, columns_to_drop,
+        cutoff_timestamps, items_per_task, quiet, ignore_data_errors,
+        num_prev_skipped, mmap_populate, legacy_boolean, timeout_per_item,
+        vector_db_path=None, exact_datetime=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -403,7 +503,8 @@ impl Sampler {
         legacy_boolean: bool,
         timeout_per_item: f64,
         vector_db_path: Option<String>,
-    ) -> Self {
+        exact_datetime: bool,
+    ) -> PyResult<Self> {
         py.allow_threads(|| {
             Self::new_impl(
                 dataset_tuples,
@@ -432,8 +533,10 @@ impl Sampler {
                 legacy_boolean,
                 timeout_per_item,
                 vector_db_path,
+                exact_datetime,
             )
         })
+        .map_err(pyo3::exceptions::PyValueError::new_err)
     }
 
     #[getter]
@@ -469,7 +572,7 @@ impl Sampler {
     ) -> PyResult<Vec<PyObject>> {
         let bs = node_idxs.len();
         let table_name = &self.dataset_tuples[dataset_idx].1;
-        let mut vecs = Vecs::new(bs, ctx_size, self.d_text);
+        let mut vecs = Vecs::new(bs, ctx_size, self.d_text, self.exact_datetime);
 
         py.allow_threads(|| {
             vecs.chunks_exact_mut(ctx_size, self.d_text)
@@ -540,7 +643,8 @@ impl Sampler {
         legacy_boolean: bool,
         timeout_per_item: f64,
         vector_db_path: Option<String>,
-    ) -> Self {
+        exact_datetime: bool,
+    ) -> Result<Self, String> {
         let embedder_ref = embedder;
 
         assert_eq!(
@@ -557,6 +661,17 @@ impl Sampler {
             }
         }
 
+        // This preflight deliberately precedes ignore_data_errors: exact mode
+        // cannot silently discard a database with missing or stale timestamps.
+        let mut sidecars = HashMap::new();
+        if exact_datetime {
+            for db_name in db_to_tables.keys() {
+                let path = std::path::Path::new(&pre_dir).join(db_name);
+                let sidecar = datetime::Sidecar::open(&path)
+                    .map_err(|e| format!("exact_datetime {}: {e}", path.display()))?;
+                sidecars.insert(db_name.clone(), Arc::new(sidecar));
+            }
+        }
         let mut mmap_opts = MmapOptions::new();
         if mmap_populate {
             mmap_opts.populate();
@@ -579,6 +694,7 @@ impl Sampler {
                     &mmap_opts,
                     embedder_ref,
                     vector_db_path_ref,
+                    sidecars.get(db_name).cloned(),
                 )
             });
             let r = if ignore_data_errors {
@@ -705,6 +821,7 @@ impl Sampler {
             "prefer_latest_list must be non-empty"
         );
         let mut sampler = Self {
+            exact_datetime,
             global_rank,
             local_rank,
             world_size,
@@ -753,7 +870,7 @@ impl Sampler {
                 fmt_thousands(num_skipped),
             );
         }
-        sampler
+        Ok(sampler)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -765,6 +882,7 @@ impl Sampler {
         mmap_opts: &MmapOptions,
         embedder_ref: &str,
         vector_db_path: Option<&str>,
+        datetime: Option<Arc<datetime::Sidecar>>,
     ) -> (String, Dataset) {
         let pre_path = format!("{}/{}", pre_dir, db_name);
 
@@ -854,6 +972,7 @@ impl Sampler {
         (
             db_name.to_owned(),
             Dataset {
+                datetime,
                 mmap,
                 text_mmap,
                 p2f_adj_mmap,
@@ -912,7 +1031,7 @@ impl Sampler {
         match batch_idx {
             Some(idx) => {
                 let offset = self.global_rank * bs + idx * bs * self.world_size;
-                let mut vecs = Vecs::new(bs, ctx_size, self.d_text);
+                let mut vecs = Vecs::new(bs, ctx_size, self.d_text, self.exact_datetime);
 
                 for (i, m) in vecs.batch_mask.iter_mut().enumerate() {
                     *m = offset + i < self.items.len();
@@ -941,6 +1060,9 @@ impl Sampler {
                             Err(p) => panic_msg(&*p).to_string(),
                         };
                         slices.is_targets.fill(false);
+                        if let Some(exact) = &mut slices.exact {
+                            exact.clear();
+                        }
                         slices.is_padding.fill(true);
                         let db_name = &self.dataset_tuples[item.dataset_idx as usize].0;
                         eprintln!(
@@ -962,7 +1084,7 @@ impl Sampler {
                     (self.context_seed + step).wrapping_add(0xE0E0_E0E0_E0E0_E0E0),
                 );
 
-                let mut vecs = Vecs::new(bs, ctx_size, self.d_text);
+                let mut vecs = Vecs::new(bs, ctx_size, self.d_text, self.exact_datetime);
 
                 vecs.batch_mask.iter_mut().for_each(|m| *m = true);
 
@@ -1022,6 +1144,9 @@ impl Sampler {
                 }
             }
             slices.is_targets.fill(false);
+            if let Some(exact) = &mut slices.exact {
+                exact.clear();
+            }
             slices.is_padding.fill(true);
             let next_idx = StdRng::seed_from_u64(retry_seed).random_range(0..self.items.len());
             current_item = &self.items[next_idx];
@@ -1063,7 +1188,8 @@ impl Sampler {
                     f32::from(target_node.number_values[target_cell_i]).is_nan()
                 }
                 ArchivedSemType::DateTime => {
-                    f32::from(target_node.datetime_values[target_cell_i]).is_nan()
+                    !self.exact_datetime
+                        && f32::from(target_node.datetime_values[target_cell_i]).is_nan()
                 }
                 ArchivedSemType::Boolean => {
                     f32::from(target_node.boolean_values[target_cell_i]).is_nan()
@@ -1216,7 +1342,11 @@ impl Sampler {
                     let mut vdb = VectorDbStream::new(entry, target_node_idx, target_node, cutoff);
                     while let Some(seed_node_idx) = vdb.next(dataset) {
                         check_deadline(deadline);
-                        if seed_label_missing(get_node(dataset, seed_node_idx), target_column) {
+                        if seed_label_missing(
+                            get_node(dataset, seed_node_idx),
+                            target_column,
+                            self.exact_datetime,
+                        ) {
                             continue;
                         }
                         if extend_with_seed_bfs(
@@ -1244,7 +1374,11 @@ impl Sampler {
             } else {
                 for &seed_node_idx in visited_sorted.iter() {
                     check_deadline(deadline);
-                    if seed_label_missing(get_node(dataset, seed_node_idx), target_column) {
+                    if seed_label_missing(
+                        get_node(dataset, seed_node_idx),
+                        target_column,
+                        self.exact_datetime,
+                    ) {
                         continue;
                     }
                     if extend_with_seed_bfs(
@@ -1311,7 +1445,7 @@ impl Sampler {
                     let node = get_node(dataset, n);
                     !past_bound(node, bound)
                         && !same_horizon_task_row(node, target_node)
-                        && !seed_label_missing(node, target_column)
+                        && !seed_label_missing(node, target_column, self.exact_datetime)
                 });
                 check_deadline(deadline);
                 let ts_of: HashMap<i32, Option<i32>> = fallback_order
@@ -1354,7 +1488,7 @@ impl Sampler {
                 {
                     continue;
                 }
-                if seed_label_missing(seed_node, target_column) {
+                if seed_label_missing(seed_node, target_column, self.exact_datetime) {
                     continue;
                 }
                 if extend_with_seed_bfs(
@@ -1540,7 +1674,9 @@ impl Sampler {
     ) {
         let value_is_nan = match &node.sem_types[cell_i] {
             ArchivedSemType::Number => f32::from(node.number_values[cell_i]).is_nan(),
-            ArchivedSemType::DateTime => f32::from(node.datetime_values[cell_i]).is_nan(),
+            ArchivedSemType::DateTime => {
+                !self.exact_datetime && f32::from(node.datetime_values[cell_i]).is_nan()
+            }
             ArchivedSemType::Boolean => f32::from(node.boolean_values[cell_i]).is_nan(),
             ArchivedSemType::Text => false,
         };
@@ -1576,6 +1712,20 @@ impl Sampler {
             .copy_from_slice(get_text_emb(dataset, text_idx, self.d_text));
 
         slices.datetime_values[*seq_i] = bf16::from_f32(node.datetime_values[cell_i].into());
+        if matches!(node.sem_types[cell_i], ArchivedSemType::DateTime)
+            && let (Some(sidecar), Some(exact)) = (&dataset.datetime, &mut slices.exact)
+        {
+            let raw = sidecar
+                .value(node, cell_i)
+                .expect("validated exact datetime cell");
+            let features = raw.features().expect("validated calendar14 range");
+            exact.features[*seq_i * datetime::FEATURES..(*seq_i + 1) * datetime::FEATURES]
+                .copy_from_slice(&features);
+            exact.seconds[*seq_i] = raw.seconds;
+            exact.nanoseconds[*seq_i] = raw.nanoseconds as i32;
+            exact.valid[*seq_i] = true;
+            exact.target_values[*seq_i] = sidecar.normalization.target(raw);
+        }
 
         slices.is_targets[*seq_i] =
             if node.node_idx == target_node_idx && node.col_name_idxs[cell_i] == target_column {
@@ -1953,7 +2103,7 @@ fn edge_past_bound(edge: &ArchivedEdge, bound: Option<i32>) -> bool {
     }
 }
 
-fn seed_label_missing(node: &ArchivedNode, target_column: i32) -> bool {
+fn seed_label_missing(node: &ArchivedNode, target_column: i32, exact_datetime: bool) -> bool {
     let cell_i = match node
         .col_name_idxs
         .iter()
@@ -1965,7 +2115,9 @@ fn seed_label_missing(node: &ArchivedNode, target_column: i32) -> bool {
     match &node.sem_types[cell_i] {
         ArchivedSemType::Number => f32::from(node.number_values[cell_i]).is_nan(),
         ArchivedSemType::Boolean => f32::from(node.boolean_values[cell_i]).is_nan(),
-        ArchivedSemType::DateTime => f32::from(node.datetime_values[cell_i]).is_nan(),
+        ArchivedSemType::DateTime => {
+            !exact_datetime && f32::from(node.datetime_values[cell_i]).is_nan()
+        }
         ArchivedSemType::Text => false,
     }
 }
@@ -2052,7 +2204,9 @@ pub fn main(cli: Cli) {
         false,
         1.0,
         None,
-    );
+        false,
+    )
+    .expect("cannot load sampler");
     println!("Sampler loaded in {:?}", tic.elapsed());
 
     let mut sum = 0;
