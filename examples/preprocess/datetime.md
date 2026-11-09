@@ -66,6 +66,10 @@ Calendar batches retain integer source pairs for inspection and include
 `datetime_features` (BF16, 14 channels), `datetime_valid` (bool), and
 `datetime_target_values` (FP32, one channel). The legacy BF16 scalar field is
 retained for compatibility and is not used by the calendar encoder.
+Retained datetime cells whose legacy normalization produced NaN, such as
+constant dates, are recovered from their source values. This can change sampled
+context occupancy and random-mask draws relative to scalar mode; columns already
+discarded by graph preprocessing are not recovered.
 
 The reconstruction target is normalized separately from context features.
 Population mean and standard deviation are computed in FP64 after subtracting

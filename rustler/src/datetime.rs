@@ -821,9 +821,16 @@ fn integer(v: AnyValue<'_>) -> Result<Option<i64>> {
 fn foreign_values(v: AnyValue<'_>) -> Result<Vec<i64>> {
     match v {
         AnyValue::List(values) => {
-            let values: Result<Vec<Option<i64>>> = values.iter().map(integer).collect();
+            let values: Result<Vec<Option<i64>>> = values
+                .iter()
+                .filter(|v| !matches!(v, AnyValue::Boolean(_)))
+                .map(integer)
+                .collect();
             Ok(values?.into_iter().flatten().collect())
         }
+        // pre::fk_parent_idxs omits Boolean keys before its later scalar
+        // Boolean-to-number conversion. Preserve those archived edges exactly.
+        AnyValue::Boolean(_) => Ok(Vec::new()),
         v => Ok(integer(v)?.into_iter().collect()),
     }
 }
@@ -1938,6 +1945,140 @@ mod tests {
             crate::pre::main(cli);
         }
         (raw, output.join("fixture"))
+    }
+
+    #[test]
+    fn boolean_foreign_keys_follow_legacy_omission() {
+        // pre::fk_parent_idxs ignores Boolean scalar/list elements; converting
+        // them to 0/1 here would invent edges absent from released archives.
+        for value in [false, true] {
+            assert!(foreign_values(AnyValue::Boolean(value)).unwrap().is_empty());
+            assert!(integer(AnyValue::Boolean(value)).is_err()); // PK policy stays strict.
+        }
+        let values = Series::new("".into(), &[Some(false), Some(true), None]);
+        assert!(foreign_values(AnyValue::List(values)).unwrap().is_empty());
+        assert!(foreign_values(AnyValue::Null).unwrap().is_empty());
+        assert_eq!(foreign_values(AnyValue::Int64(1)).unwrap(), [1]);
+        assert!(foreign_values(AnyValue::Float64(0.5)).is_err());
+    }
+
+    #[test]
+    fn boolean_foreign_keys_bind_fresh_and_historical_without_new_edges() {
+        let temp = Temp::new();
+        let raw = temp.0.join("raw");
+        let output = temp.0.join("pre");
+        fs::create_dir_all(raw.join("db")).unwrap();
+        fs::write(raw.join("manifest.yaml"),
+            "name: fixture\ntables:\n  parents:\n    pkey: id\n    time_col: event\n  events:\n    pkey: id\n    time_col: event\n    fkeys:\n      parent: parents\n      flag_parent: parents\n").unwrap();
+        parquet_dates(
+            &raw.join("db/parents.parquet"),
+            &[Some(0), Some(2_000_000)],
+            true,
+        );
+        let write_events = |first_flag| {
+            let dates = Series::new("event".into(), [1_000_000_i64, 3_000_000, 5_000_000])
+                .cast(&DataType::Datetime(TimeUnit::Microseconds, None))
+                .unwrap();
+            let mut df = DataFrame::new(vec![
+                Series::new("id".into(), [0_i64, 1, 2]).into(),
+                dates.into(),
+                Series::new("parent".into(), [Some(1_i64), Some(0), None]).into(),
+                Series::new("flag_parent".into(), [Some(first_flag), Some(true), None]).into(),
+            ])
+            .unwrap();
+            ParquetWriter::new(File::create(raw.join("db/events.parquet")).unwrap())
+                .finish(&mut df)
+                .unwrap();
+        };
+        write_events(false);
+        preprocess_exact(crate::pre::Cli {
+            dataset_dir: raw.display().to_string(),
+            out_dir: output.display().to_string(),
+            source: None,
+            skip_tasks: true,
+            skip_db: false,
+        })
+        .unwrap();
+        let pre = output.join("fixture");
+        let base: Vec<_> = BASE_FILES
+            .iter()
+            .map(|name| fs::read(pre.join(name)).unwrap())
+            .collect();
+        let payload = fs::read(pre.join(DATA)).unwrap();
+        let tables: HashMap<String, TableInfo> =
+            serde_json::from_reader(File::open(pre.join("table_info.json")).unwrap()).unwrap();
+        let columns: HashMap<String, i32> =
+            serde_json::from_reader(File::open(pre.join("column_index.json")).unwrap()).unwrap();
+        let nodes = unsafe { Mmap::map(&File::open(pre.join("nodes.rkyv")).unwrap()).unwrap() };
+        let offsets_map =
+            unsafe { Mmap::map(&File::open(pre.join("offsets.rkyv")).unwrap()).unwrap() };
+        let offsets = rkyv::access::<ArchivedOffsets, Error>(&offsets_map).unwrap();
+        let exact = Sidecar::open(&pre).unwrap();
+        let parent_offset = tables["parents:Db"].node_idx_offset;
+        for (row, parent) in [Some(1), Some(0), None].into_iter().enumerate() {
+            let node = archive_node(
+                &nodes,
+                offsets,
+                tables["events:Db"].node_idx_offset as usize + row,
+            )
+            .unwrap();
+            let actual: Vec<i32> = node.f2p_nbr_idxs.iter().map(|v| (*v).into()).collect();
+            assert_eq!(
+                actual,
+                parent
+                    .map(|v| parent_offset + v)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            );
+            let cell = node
+                .col_name_idxs
+                .iter()
+                .position(|v| i32::from(*v) == columns["event of events"])
+                .unwrap();
+            assert_eq!(
+                exact.value(node, cell).unwrap(),
+                Timestamp {
+                    seconds: 1 + row as i64 * 2,
+                    nanoseconds: 0
+                }
+            );
+        }
+        drop(exact);
+        validate(&pre).unwrap();
+        let mut receipt: SourceReceipt =
+            serde_json::from_reader(File::open(pre.join(SOURCE)).unwrap()).unwrap();
+        receipt.kind = "historical".into();
+        receipt.origin = Origin {
+            issuer: "Boolean FK fixture authority".into(), raw_revision: "immutable Boolean source fixture".into(),
+            archive_revision: "immutable observed fixture archive".into(),
+            evidence: "test authority observed the preceding fresh operation; Boolean FK omission is legacy behavior".into(),
+        };
+        let external = temp.0.join("trusted.json");
+        write_json(&external, &receipt).unwrap();
+        for name in [META, DATA, SOURCE] {
+            fs::remove_file(pre.join(name)).unwrap();
+        }
+        backfill(&raw, &pre, Some(&external)).unwrap();
+        validate(&pre).unwrap();
+        assert_eq!(fs::read(pre.join(DATA)).unwrap(), payload);
+        assert_eq!(
+            fs::read(pre.join(SOURCE)).unwrap(),
+            fs::read(&external).unwrap()
+        );
+        for (name, bytes) in BASE_FILES.iter().zip(&base) {
+            assert_eq!(&fs::read(pre.join(name)).unwrap(), bytes);
+        }
+        let published_meta = fs::read(pre.join(META)).unwrap();
+        // Ignoring a Boolean for adjacency must not exempt it from provenance.
+        write_events(true);
+        assert!(
+            backfill(&raw, &pre, Some(&external))
+                .unwrap_err()
+                .to_string()
+                .contains("content mismatch")
+        );
+        assert_eq!(fs::read(pre.join(META)).unwrap(), published_meta);
+        assert_eq!(fs::read(pre.join(DATA)).unwrap(), payload);
     }
 
     #[test]
