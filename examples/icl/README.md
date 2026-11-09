@@ -38,3 +38,15 @@ and no checkpoint was trained on any RelBench database.
 
 Point `RT_PRE_DIR` at your preprocessed data and `RT_TASKS` at a JSON file of
 `[db, task]` pairs.
+
+Calendar19 evaluation uses cache version `calendar_datetime_v2`. Old calendar14
+or unmarked results cannot resume or count as completed calendar19 work, even
+though both models use `datetime_encoding="calendar"`. The ensemble evaluator,
+ICL worker, and tuning/ensemble job planners check the version before reusing
+partial predictions or skipping completed outputs. Use a fresh evaluation
+`run_id`/output directory and tuning grid namespace when switching generations;
+existing artifacts are preserved on rejection. Unmarked legacy scalar results
+remain compatible with scalar mode. This barrier distinguishes datetime context
+representations, not arbitrary checkpoint weights: continue using distinct
+output namespaces for different checkpoints and deliberately selected context
+configurations. Native calendar14 sidecars are unchanged.

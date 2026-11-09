@@ -3,6 +3,12 @@ import os
 import uuid
 from pathlib import Path
 
+from rt.eval_cache import (
+    check_datetime_cache,
+    checkpoint_datetime_cache_version,
+    datetime_cache_version,
+)
+
 
 def main(
     *,
@@ -32,12 +38,21 @@ def main(
 ) -> None:
     out = Path(out_dir).expanduser()
     final_path = out / f"{db}__{table}.json"
+    state_path = out / f"{db}__{table}.state.npz"
     if final_path.exists():
+        version = checkpoint_datetime_cache_version(ckpt)
+        saved = json.loads(final_path.read_text())
+        check_datetime_cache(saved.get("config", {}), version)
         print(f"{final_path} exists; nothing to do", flush=True)
         return
-    state_path = out / f"{db}__{table}.state.npz"
 
     import numpy as np
+
+    if state_path.exists():
+        version = checkpoint_datetime_cache_version(ckpt)
+        with np.load(state_path) as st:
+            check_datetime_cache(st, version)
+
     import torch
 
     from rt.data import get_tasks
@@ -49,15 +64,17 @@ def main(
     (task,) = get_tasks(pre_dir, [(db, table)], (split,))
     model, config = load_rt_model(ckpt, device=device, compile=device == "cuda")
     model = model.set_compute_dtype(torch.bfloat16)
+    version = datetime_cache_version(model.datetime_encoding)
 
     curve: dict[str, float] = {}
     sum_preds = labels0 = nodes0 = None
     start = 0
     if state_path.exists():
-        st = np.load(state_path)
-        sum_preds, labels0, nodes0 = st["sum_preds"], st["labels"], st["node_idxs"]
-        start = int(st["seeds"])
-        curve = json.loads(str(st["curve"]))
+        with np.load(state_path) as st:
+            check_datetime_cache(st, version)
+            sum_preds, labels0, nodes0 = st["sum_preds"], st["labels"], st["node_idxs"]
+            start = int(st["seeds"])
+            curve = json.loads(str(st["curve"]))
         print(f"resumed at seed {start}", flush=True)
 
     for seed in range(start, n_seeds):
@@ -106,6 +123,7 @@ def main(
             node_idxs=nodes0,
             seeds=k,
             curve=json.dumps(curve),
+            datetime_context_version=version,
         )
         os.replace(tmp, state_path)
         del ev
@@ -130,6 +148,7 @@ def main(
             "db_cutoff": db_cutoff,
             "split": split,
             "checkpoint": ckpt,
+            "datetime_context_version": version,
         },
     }
     tmp = out / f".tmp.{os.getpid()}.{uuid.uuid4().hex}.json"

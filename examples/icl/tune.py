@@ -6,6 +6,7 @@ from examples.icl import env
 from examples.icl.models import model_from_argv
 from examples.icl.tasks import task_list
 from examples.launch import Job, describe, run_sequential
+from rt.eval_cache import check_datetime_cache, checkpoint_datetime_cache_version
 
 CTX_GRID = [512, 1024, 2048, 4096, 8192]
 LCS_BW_PL_GRID = [
@@ -55,8 +56,14 @@ def load_configs(
 def jobs(*, ckpt: str, grid_stem: str, task_list: list[tuple[str, str]]) -> list[Job]:
     out_root = env.out_root()
     out = []
+    version = None
     for db, table in task_list:
-        if grid_path(grid_stem, db, table).exists():
+        saved_path = grid_path(grid_stem, db, table)
+        if saved_path.exists():
+            if version is None:
+                version = checkpoint_datetime_cache_version(ckpt)
+            saved = json.loads(saved_path.read_text())[f"{db}/{table}"]
+            check_datetime_cache(saved, version)
             continue
         run_id = grid_stem.format(db=db, table=table)
         out.append(

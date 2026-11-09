@@ -14,6 +14,7 @@ from rt.data import get_tasks
 from rt.eval.evaluator import Evaluator
 from rt.eval.metrics import metric_for
 from rt.eval.relbench import _emit_and_score
+from rt.eval_cache import CALENDAR_DATETIME_CACHE_VERSION, datetime_cache_version
 from rt.model import load_rt_model
 from rt.utils import log, setup_env
 
@@ -444,7 +445,7 @@ def run_ensemble(
         eval_kwargs["db_cutoff"],
     ]
     if eval_kwargs.get("exact_datetime", False):
-        guard.append("calendar_datetime_v1")
+        guard.append(CALENDAR_DATETIME_CACHE_VERSION)
     state = {}
     if resume_path.exists():
         state = torch.load(resume_path, weights_only=False)
@@ -557,6 +558,9 @@ def run_ensemble(
                             "task_type": best[db, table]["task_type"],
                             "val_ensemble_size": val_ensemble_size,
                             "val_scores": by_cfg,
+                            "datetime_context_version": datetime_cache_version(
+                                getattr(model, "datetime_encoding", "scalar")
+                            ),
                         }
                         for (db, table), by_cfg in scores.items()
                     },

@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -6,6 +7,7 @@ from examples.icl.models import model_from_argv
 from examples.icl.tasks import task_list
 from examples.icl.tune import load_configs
 from examples.launch import Job, describe, run_sequential
+from rt.eval_cache import check_datetime_cache, checkpoint_datetime_cache_version
 
 N_CFGS = 4
 N_SEEDS = 4
@@ -23,11 +25,17 @@ def jobs(
     out_root = env.out_root()
     cfgs = load_configs(configs_path, grid_stem, task_list)
     out = []
+    version = None
     for task_key, rec in sorted(cfgs.items()):
         db, table = task_key.split("/")
         for rank, (ctx, lcs, bw, pl) in enumerate(rec["top_cfgs"][:N_CFGS]):
             out_dir = f"{out_root}/{out_subdir}/cfg{rank}"
-            if (Path(out_dir) / f"{db}__{table}.json").exists():
+            saved_path = Path(out_dir) / f"{db}__{table}.json"
+            if saved_path.exists():
+                if version is None:
+                    version = checkpoint_datetime_cache_version(ckpt)
+                saved = json.loads(saved_path.read_text())
+                check_datetime_cache(saved.get("config", {}), version)
                 continue
             out.append(
                 Job(
