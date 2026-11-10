@@ -207,11 +207,14 @@ def test_controlled_calendar_projection_norm_and_column_sum_keep_date_pair_disti
     assert torch.equal(b["datetime_features"][0, 0].float(), a)
     with torch.no_grad():
         m.enc_dict["datetime"].weight.zero_()
-        m.enc_dict["datetime"].weight[:14].copy_(torch.eye(14))
+        m.enc_dict["datetime"].weight[:14, :14].copy_(torch.eye(14))
         m.enc_dict["datetime"].bias.zero_()
         m.enc_dict["col_name"].weight.zero_()
         m.enc_dict["col_name"].bias.fill_(0.25)
-    projected = m.enc_dict["datetime"](b["datetime_features"])
+    features = net._calendar_context_features(
+        b["datetime_features"], b["datetime_target_values"], b["datetime_valid"]
+    )
+    projected = m.enc_dict["datetime"](features)
     normalized = m.norm_dict["datetime"](projected)
     column = m.norm_dict["col_name"](m.enc_dict["col_name"](b["col_name_values"]))
     for stage in [
@@ -256,6 +259,158 @@ def test_hidden_datetime_payload_never_changes_predictions():
     assert not torch.equal(
         outputs["datetime"][:, -1], context_outputs["datetime"][:, -1]
     )
+
+
+def _normalized_bit_patterns():
+    corners = torch.tensor(
+        [
+            0,
+            -2147483648,
+            1,
+            -2147483647,
+            0x007FFFFF,
+            0x00800000,
+            0x3F800000,
+            0x3F800001,
+            0x3F810000,
+            0x7F7FFFFF,
+            -8388609,
+            0x7FC00000,
+            0x7F800000,
+            -8388608,
+        ],
+        dtype=torch.int32,
+    )
+    random = torch.randint(
+        -2147483648,
+        2147483647,
+        (1024,),
+        generator=torch.Generator().manual_seed(89),
+        dtype=torch.int32,
+    )
+    return torch.cat([corners, random]).reshape(1, -1, 1)
+
+
+@pytest.mark.parametrize("autocast", [False, True])
+def test_calendar19_preserves_normalized_fp32_bits_and_native14(autocast):
+    bits = _normalized_bit_patterns()
+    values = bits.view(torch.float32)
+    permitted = torch.isfinite(values[..., 0])
+    calendar = torch.arange(14).bfloat16().expand(1, values.shape[1], 14) / 256
+    before = values.view(torch.int32).clone()
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
+        features = net._calendar_context_features(calendar, values, permitted)
+    assert features.shape == (*permitted.shape, 19)
+    assert features.dtype == torch.bfloat16
+    assert torch.isfinite(features).all()
+    assert torch.equal(features[..., :14][permitted], calendar[permitted])
+    assert (features[~permitted] == 0).all()
+    # Reconstruct bytes independently with integer place values.
+    digits = (features[..., 15:].float() * 256).long()
+    reconstructed = (digits * torch.tensor([1 << 24, 1 << 16, 1 << 8, 1])).sum(-1)
+    expected = torch.where(permitted, bits[..., 0], 0)
+    assert torch.equal(reconstructed.int(), expected)
+    assert torch.equal(values.view(torch.int32), before)
+    exponent_zero = (expected & 0x7F800000) == 0
+    assert (features[..., 14].contiguous().view(torch.int16)[exponent_zero] == 0).all()
+    assert features[..., 14].abs().max() <= 1
+
+
+def test_normalized_byte_channels_keep_distinction_lost_by_coarse_cue():
+    values = torch.tensor([1.0, 129 / 128]).reshape(1, 2, 1)
+    assert values.bfloat16()[0, 0] != values.bfloat16()[0, 1]
+    features = net._calendar_context_features(
+        torch.zeros(1, 2, 14, dtype=torch.bfloat16),
+        values,
+        torch.ones(1, 2, dtype=torch.bool),
+    )
+    assert features[0, :, 14].tolist() == [0.5, 0.5]
+    assert features[0, 0, 15:].tolist() == [63 / 256, 128 / 256, 0, 0]
+    assert features[0, 1, 15:].tolist() == [63 / 256, 129 / 256, 0, 0]
+
+
+def test_calendar19_masks_before_arithmetic_and_bit_extraction():
+    values = torch.tensor([1.25, float("nan"), float("inf"), -float("inf")]).reshape(
+        1, 4, 1
+    )
+    calendar = torch.full((1, 4, 14), float("nan"), dtype=torch.bfloat16)
+    calendar[:, 0] = torch.arange(14).bfloat16() / 256
+    permitted = torch.tensor([[True, False, False, False]])
+    observed = net._calendar_context_features(calendar, values, permitted)
+    assert torch.isfinite(observed).all()
+    assert (observed[:, 1:] == 0).all()
+    values[:, 1:] = -12345.0
+    calendar[:, 1:] = 123.0
+    assert torch.equal(
+        observed, net._calendar_context_features(calendar, values, permitted)
+    )
+
+
+def test_calendar19_feature_helper_cpu_inductor_matches_eager():
+    values = _normalized_bit_patterns().view(torch.float32)
+    permitted = torch.isfinite(values[..., 0])
+    calendar = torch.zeros(1, values.shape[1], 14, dtype=torch.bfloat16)
+    expected = net._calendar_context_features(calendar, values, permitted)
+    compiled = torch.compile(net._calendar_context_features, fullgraph=True)
+    assert torch.equal(compiled(calendar, values, permitted), expected)
+    assert not torch.cuda.is_initialized()
+
+
+def test_same_raw_calendar_different_training_normalizations_reach_model():
+    # Native witness: events times [10,11], unreachable calibration table [0,1]
+    # or [30,31], with both date columns repeating each timestamp. The same
+    # masked raw date is recoverable by copying its visible same-row date.
+    torch.manual_seed(17)
+    m = model(d_model=32, num_blocks=1)
+    b = batch()
+    b["node_idxs"].fill_(1)
+    b["sem_types"].fill_(2)
+    b["is_targets"][:] = torch.tensor([[True, False, False, False]])
+    b["is_padding"][0, 3] = True
+    b["datetime_valid"][:] = ~b["is_padding"]
+    raw = torch.tensor([10.0, 10.0, 11.0, 0.0]).reshape(1, 4, 1)
+    date = torch.tensor([0, 7, 208, 1, 1, 0, 0, 10, 0, 0, 0, 0, 0, 0]) / 256
+    b["datetime_features"][:] = date.bfloat16()
+    b["datetime_features"][0, 2, 7] = 11 / 256
+    b["datetime_seconds"][:] = 946684800 + raw[..., 0].long()
+    b["datetime_nanoseconds"].zero_()
+    a = {k: v.clone() for k, v in b.items()}
+    a["datetime_target_values"] = ((raw.double() - 5.5) / (25.25**0.5)).float()
+    b["datetime_target_values"] = ((raw.double() - 20.5) / (100.25**0.5)).float()
+    assert a["datetime_target_values"][0, 0, 0].item() == pytest.approx(0.8955334)
+    assert b["datetime_target_values"][0, 0, 0].item() == pytest.approx(-1.0486900)
+    assert torch.equal(a["datetime_features"], b["datetime_features"])
+    with torch.no_grad():
+        m.enc_dict["datetime"].weight.zero_()
+        m.enc_dict["datetime"].weight[:19, :19].copy_(torch.eye(19))
+        m.enc_dict["datetime"].bias.zero_()
+        # Ensure the visible context actually reaches the masked target.
+        attn = m.blocks[0].attns["feat"]
+        attn.wq.weight.zero_()
+        attn.wk.weight.zero_()
+        attn.wv.weight.copy_(torch.eye(32))
+        attn.wo.weight.copy_(torch.eye(32))
+    inputs = []
+    handle = m.enc_dict["datetime"].register_forward_pre_hook(
+        lambda _module, args: inputs.append(args[0].detach().clone())
+    )
+    hidden_a = m(a, return_embeddings=True)
+    hidden_b = m(b, return_embeddings=True)
+    handle.remove()
+    order = torch.tensor([[1, 2, 0, 3]])
+    target = a["is_targets"].gather(1, order)
+    assert inputs[0].shape[-1] == m.enc_dict["datetime"].in_features == 19
+    assert torch.equal(inputs[0][..., :14], inputs[1][..., :14])
+    assert torch.equal(
+        inputs[0][..., 14:],
+        net._calendar_context_features(
+            a["datetime_features"].gather(1, order[..., None].expand(-1, -1, 14)),
+            a["datetime_target_values"].gather(1, order[..., None]),
+            (~a["is_targets"] & ~a["is_padding"]).gather(1, order),
+        )[..., 14:],
+    )
+    assert (inputs[0][target] == 0).all() and (inputs[1][target] == 0).all()
+    assert not torch.equal(hidden_a[target], hidden_b[target])
 
 
 @pytest.mark.parametrize("loss_fn", ["huber", "l1", "bce"])
@@ -553,7 +708,7 @@ def test_file_encoding_fills_missing_config_tag_and_respects_checkpoint_filename
     )
     loaded = net.RelationalTransformer.from_pretrained(tmp_path if directory else path)
     assert loaded.datetime_encoding == "calendar"
-    assert loaded.enc_dict["datetime"].in_features == 14
+    assert loaded.enc_dict["datetime"].in_features == 19
 
 
 @pytest.mark.parametrize(
@@ -662,6 +817,41 @@ def test_shared_head_validator_keeps_scalar_compatibility_and_requires_calendar_
         checkpoints.validate_datetime_state_dict(state, "calendar")
     with pytest.raises(ValueError, match="unknown datetime_encoding"):
         checkpoints.validate_datetime_state_dict(state, "other")
+
+
+@pytest.mark.parametrize("tag_source", ["config", "file"])
+def test_old14_calendar_checkpoints_rejected_before_load_or_warmstart(
+    tmp_path, tag_source
+):
+    state = model().state_dict()
+    state["enc_dict.datetime.weight"] = state["enc_dict.datetime.weight"][
+        :, :14
+    ].clone()
+    path = tmp_path / "model.safetensors"
+    config = {"model": DIMS.copy()}
+    metadata = {}
+    if tag_source == "config":
+        config["model"]["datetime_encoding"] = "calendar"
+    else:
+        metadata["datetime_encoding"] = "calendar"
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    checkpoints.save_model(state, path, metadata)
+    with pytest.raises(ValueError, match="obsolete 14-coordinate.*requires 19"):
+        checkpoints.validate_datetime_state_dict(state, "calendar")
+    resolved_config, resolved_path = checkpoints.resolve_checkpoint(path)
+    with pytest.raises(ValueError, match="obsolete 14-coordinate.*requires 19"):
+        checkpoints.load_model(
+            resolved_path,
+            datetime_encoding=resolved_config["model"]["datetime_encoding"],
+        )
+    with pytest.raises(ValueError, match="obsolete 14-coordinate.*requires 19"):
+        net.RelationalTransformer.from_pretrained(path)
+    # Raw PyTorch loading is still strict even without the public file loader.
+    with pytest.raises(
+        RuntimeError, match="size mismatch for enc_dict.datetime.weight"
+    ):
+        model().load_state_dict(state)
+    assert state["enc_dict.datetime.weight"].shape[1] == 14
 
 
 @pytest.mark.parametrize("precision", ["ieee", "none", "tf32", "unknown", None])

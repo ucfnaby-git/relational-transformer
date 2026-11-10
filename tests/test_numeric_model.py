@@ -427,6 +427,57 @@ def test_independent_checkpoint_roundtrip(tmp_path, numeric, datetime, tag_sourc
     )
 
 
+@pytest.mark.parametrize("numeric", ["scalar", "bits"])
+@pytest.mark.parametrize("tag_source", ["config", "file"])
+def test_old14_calendar_rejected_by_generic_and_compatibility_loaders(
+    tmp_path, numeric, tag_source
+):
+    state = model(numeric=numeric, datetime="calendar").state_dict()
+    state["enc_dict.datetime.weight"] = state["enc_dict.datetime.weight"][
+        :, :14
+    ].clone()
+    modes = {"datetime_encoding": "calendar", "numeric_encoding": numeric}
+    path = tmp_path / "model.safetensors"
+    config = {"model": {**DIMS, **(modes if tag_source == "config" else {})}}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    checkpoints.save_model(state, path, modes if tag_source == "file" else {})
+    for validate in (
+        lambda: checkpoints.validate_precision_state_dict(state, **modes),
+        lambda: checkpoints.validate_datetime_state_dict(state, "calendar"),
+        lambda: checkpoints.load_model(path, **modes),
+        lambda: net.RelationalTransformer.from_pretrained(path),
+    ):
+        with pytest.raises(ValueError, match="obsolete 14-coordinate.*requires 19"):
+            validate()
+    if tag_source == "file":
+        with pytest.raises(ValueError, match="obsolete 14-coordinate.*requires 19"):
+            checkpoints.load_model(path)
+
+
+@pytest.mark.parametrize("numeric", ["scalar", "bits"])
+@pytest.mark.parametrize("datetime", ["scalar", "calendar"])
+def test_calendar19_normalized_context_activation_is_independent(numeric, datetime):
+    m = model(numeric=numeric, datetime=datetime)
+    b = batch()
+    b["is_targets"][0, 0] = False
+    b["datetime_target_values"][0, 0] = 1.0
+    inputs = []
+    handle = m.enc_dict["datetime"].register_forward_pre_hook(
+        lambda _module, args: inputs.append(args[0].detach().clone())
+    )
+    m(b, return_embeddings=True)
+    b["datetime_target_values"][0, 0] = 129 / 128
+    m(b, return_embeddings=True)
+    handle.remove()
+    if datetime == "calendar":
+        assert inputs[0].shape[-1] == 19
+        assert torch.equal(inputs[0][..., :15], inputs[1][..., :15])
+        assert not torch.equal(inputs[0][..., 15:], inputs[1][..., 15:])
+    else:
+        assert inputs[0].shape[-1] == 1
+        assert torch.equal(inputs[0], inputs[1])
+
+
 def test_standalone_numeric_file_tag_and_unmarked_legacy(tmp_path):
     path = tmp_path / "model.safetensors"
     m = model()

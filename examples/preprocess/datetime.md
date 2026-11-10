@@ -71,7 +71,7 @@ constant dates, are recovered from their source values. This can change sampled
 context occupancy and random-mask draws relative to scalar mode; columns already
 discarded by graph preprocessing are not recovered.
 
-The reconstruction target is normalized separately from context features.
+The reconstruction target uses a database-specific training normalization.
 Population mean and standard deviation are computed in FP64 after subtracting
 an integer reference timestamp. Training task tables are included;
 validation/test task tables are excluded. For database tables with a declared
@@ -81,8 +81,43 @@ column, all retained datetime cells in the database table are eligible.
 A constant or empty fit uses a standard
 deviation of one second. The fitted statistics and scope are saved in metadata.
 
+The model constructs **19 context coordinates** from the unchanged native batch:
+the 14 calendar coordinates, an approximate bounded normalized cue, then four
+exact normalized-FP32 byte coordinates. For a permitted datetime context value
+`z = datetime_target_values` and its unsigned FP32 bit pattern `u`, the five
+additional coordinates are:
+
+```text
+BF16(z / (1 + abs(z))),
+((u >> 24) & 255) / 256, ((u >> 16) & 255) / 256,
+((u >>  8) & 255) / 256, ( u        & 255) / 256
+```
+
+Cue arithmetic uses FP32. Exponent-zero values (signed zeros and subnormals)
+have an explicit +0 cue, selected from integer bits before arithmetic. The four
+bytes preserve those values, and all finite normalized FP32 bit patterns,
+exactly before projection. Every added coordinate is bounded by one in
+magnitude; nonzero byte digits are normal BF16 values. The cue alone is lossy.
+These normalized values use the same sidecar statistics as the loss, supplying
+the relative frame that absolute calendar features alone omit. They need not
+equal the old archive's separately fitted scalar values.
+
+Targets, padding, invalid and irrelevant cells are zeroed before cue arithmetic
+or bit extraction. Masked labels feed loss only; observed context values may
+supply normalization information. This does not provide the full statistics
+explicitly or prove that every missing target is identifiable.
+
+`datetime_encoding="calendar"` now requires a 19-wide datetime input adapter.
+Older experimental 14-wide calendar checkpoints are rejected explicitly; there
+is no automatic widening or optimizer/SWA conversion. Use new initializations
+and newly paired A/B checkpoints, or a separately reviewed explicit migration.
+Native Calendar14 fields and sidecars require no migration. Scalar checkpoint
+compatibility and the FP32 datetime head/loss policy are unchanged.
+
 Raw pairs and calendar features preserve source information before projection.
-The FP32 scalar target, learned projections, and predictions remain approximate.
+The added bytes preserve normalized FP32 context bits, not precision lost when
+forming that scalar. The FP32 scalar target, learned projections, and predictions
+remain approximate; input exactness is not evidence of improved model quality.
 This format does not promise invertible learned embeddings or nanosecond output
 resolution. Existing row-time filtering and columns discarded by the graph
 preprocessor are unchanged.

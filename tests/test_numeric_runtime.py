@@ -363,7 +363,7 @@ class NumericNet(nn.Module):
         self.enc_dict = nn.ModuleDict(
             {
                 "number": nn.Linear(5 if numeric_encoding == "bits" else 1, 2),
-                "datetime": nn.Linear(14 if datetime_encoding == "calendar" else 1, 2),
+                "datetime": nn.Linear(19 if datetime_encoding == "calendar" else 1, 2),
             }
         )
         self.body = nn.Linear(2, 2, bias=False)

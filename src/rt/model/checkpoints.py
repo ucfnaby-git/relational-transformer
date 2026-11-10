@@ -59,7 +59,7 @@ def _encoding(name, config_encoding, file_encoding):
 def validate_precision_state_dict(
     state_dict, *, datetime_encoding: str = "scalar", numeric_encoding: str = "scalar"
 ) -> None:
-    """Validate protected source heads before loading or explicit warm-starting.
+    """Validate calendar adapter compatibility and protected source heads.
 
     A destination FP32 parameter silently widens narrowed source tensors.
     Validate source tensors first; scalar heads retain historical dtype acceptance.
@@ -72,6 +72,15 @@ def validate_precision_state_dict(
         _encoding(name, mode, None)
         if mode == "scalar":
             continue
+        if head == "datetime":
+            adapter = state_dict.get("enc_dict.datetime.weight")
+            if adapter is not None and adapter.ndim == 2 and adapter.shape[1] == 14:
+                raise ValueError(
+                    "calendar checkpoint has an obsolete 14-coordinate datetime adapter; "
+                    "this model requires 19 coordinates (calendar14 + normalized FP32 "
+                    "cue/bytes). Use a new initialization or explicit checkpoint "
+                    "migration with fresh optimizer/SWA state; no automatic conversion."
+                )
         for key in (f"dec_dict.{head}.weight", f"dec_dict.{head}.bias"):
             value = state_dict.get(key)
             if value is None:
