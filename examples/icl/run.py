@@ -3,12 +3,32 @@ import os
 import uuid
 from pathlib import Path
 
+from rt.eval_cache import (
+    check_datetime_cache,
+    checkpoint_datetime_cache_version,
+    datetime_cache_version,
+)
+
 
 def _numeric_settings(ckpt, exact_numeric):
+    from safetensors import safe_open
+
     from rt.model.checkpoints import resolve_checkpoint
 
-    config, _ = resolve_checkpoint(ckpt)
+    config, path = resolve_checkpoint(ckpt)
     encoding = config.get("model", {}).get("numeric_encoding", "scalar")
+    with safe_open(str(path), framework="np") as checkpoint:
+        name = "enc_dict.number.weight"
+        names = checkpoint.keys()
+        if name not in names:
+            raise ValueError(f"{encoding} checkpoint is missing {name}")
+        shape = checkpoint.get_slice(name).get_shape()
+    width = 5 if encoding == "bits" else 1
+    if len(shape) != 2 or shape[1] != width:
+        raise ValueError(
+            f"{encoding} evaluation requires a {width}-coordinate number adapter; "
+            f"checkpoint shape is {shape}. Use a compatible checkpoint"
+        )
     return encoding, exact_numeric or encoding == "bits"
 
 
@@ -53,8 +73,23 @@ def main(
     out = Path(out_dir).expanduser()
     final_path = out / f"{db}__{table}.json"
     state_path = out / f"{db}__{table}.state.npz"
+    numeric_encoding, exact_numeric = _numeric_settings(ckpt, exact_numeric)
+    if final_path.exists():
+        version = checkpoint_datetime_cache_version(ckpt)
+        saved = json.loads(final_path.read_text())
+        check_datetime_cache(saved.get("config", {}), version)
+        _check_numeric_state(saved.get("config", {}), numeric_encoding, exact_numeric)
+        print(f"{final_path} exists; nothing to do", flush=True)
+        return
 
     import numpy as np
+
+    if state_path.exists():
+        version = checkpoint_datetime_cache_version(ckpt)
+        with np.load(state_path) as st:
+            check_datetime_cache(st, version)
+            _check_numeric_state(st, numeric_encoding, exact_numeric)
+
     import torch
 
     from rt.data import get_tasks
@@ -63,26 +98,21 @@ def main(
     from rt.eval.metrics import metric_for
     from rt.model import load_rt_model
 
-    numeric_encoding, exact_numeric = _numeric_settings(ckpt, exact_numeric)
-    if final_path.exists():
-        saved = json.loads(final_path.read_text())
-        _check_numeric_state(saved.get("config", {}), numeric_encoding, exact_numeric)
-        print(f"{final_path} exists; nothing to do", flush=True)
-        return
-
     (task,) = get_tasks(pre_dir, [(db, table)], (split,))
     model, config = load_rt_model(ckpt, device=device, compile=device == "cuda")
     model = model.set_compute_dtype(torch.bfloat16)
+    version = datetime_cache_version(model.datetime_encoding)
 
     curve: dict[str, float] = {}
     sum_preds = labels0 = nodes0 = None
     start = 0
     if state_path.exists():
-        st = np.load(state_path)
-        _check_numeric_state(st, numeric_encoding, exact_numeric)
-        sum_preds, labels0, nodes0 = st["sum_preds"], st["labels"], st["node_idxs"]
-        start = int(st["seeds"])
-        curve = json.loads(str(st["curve"]))
+        with np.load(state_path) as st:
+            check_datetime_cache(st, version)
+            _check_numeric_state(st, numeric_encoding, exact_numeric)
+            sum_preds, labels0, nodes0 = st["sum_preds"], st["labels"], st["node_idxs"]
+            start = int(st["seeds"])
+            curve = json.loads(str(st["curve"]))
         print(f"resumed at seed {start}", flush=True)
 
     for seed in range(start, n_seeds):
@@ -134,6 +164,7 @@ def main(
             curve=json.dumps(curve),
             numeric_encoding=numeric_encoding,
             exact_numeric=exact_numeric,
+            datetime_context_version=version,
         )
         os.replace(tmp, state_path)
         del ev
@@ -160,6 +191,7 @@ def main(
             "checkpoint": ckpt,
             "numeric_encoding": numeric_encoding,
             "exact_numeric": exact_numeric,
+            "datetime_context_version": version,
         },
     }
     tmp = out / f".tmp.{os.getpid()}.{uuid.uuid4().hex}.json"

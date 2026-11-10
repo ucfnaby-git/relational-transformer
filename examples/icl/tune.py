@@ -7,6 +7,7 @@ from examples.icl.models import model_from_argv
 from examples.icl.run import _check_numeric_state, _numeric_settings
 from examples.icl.tasks import task_list
 from examples.launch import Job, describe, run_sequential
+from rt.eval_cache import check_datetime_cache, checkpoint_datetime_cache_version
 
 CTX_GRID = [512, 1024, 2048, 4096, 8192]
 LCS_BW_PL_GRID = [
@@ -64,12 +65,17 @@ def jobs(
     out_root = env.out_root()
     out = []
     numeric_settings = None
+    version = None
     for db, table in task_list:
         saved_path = grid_path(grid_stem, db, table)
         if saved_path.exists():
             if numeric_settings is None:
                 numeric_settings = _numeric_settings(ckpt, exact_numeric)
-            for saved in json.loads(saved_path.read_text()).values():
+            if version is None:
+                version = checkpoint_datetime_cache_version(ckpt)
+            records = json.loads(saved_path.read_text())
+            check_datetime_cache(records[f"{db}/{table}"], version)
+            for saved in records.values():
                 _check_numeric_state(saved, *numeric_settings)
             continue
         run_id = grid_stem.format(db=db, table=table)

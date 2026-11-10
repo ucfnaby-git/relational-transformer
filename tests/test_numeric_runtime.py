@@ -708,8 +708,18 @@ def test_icl_planners_validate_completed_result_truth(monkeypatch, tmp_path):
         "load_configs",
         lambda *_: {"db/task": {"top_cfgs": [[2, 2, 1, True]]}},
     )
-    for module in (tune, ensemble):
-        monkeypatch.setattr(module, "_numeric_settings", lambda *_: ("bits", True))
+    ckpt = tmp_path / "checkpoint"
+    ckpt.mkdir()
+    (ckpt / "config.json").write_text(
+        json.dumps({"model": {"numeric_encoding": "bits"}})
+    )
+    save_model(
+        {
+            "enc_dict.datetime.weight": torch.zeros(2, 1),
+            "enc_dict.number.weight": torch.zeros(2, 5),
+        },
+        ckpt / "model.safetensors",
+    )
     grid = "tune-test--{db}--{table}"
     tuning_path = tune.grid_path(grid, "db", "task")
     tuning_path.parent.mkdir(parents=True)
@@ -717,7 +727,7 @@ def test_icl_planners_validate_completed_result_truth(monkeypatch, tmp_path):
     testing_path.parent.mkdir(parents=True)
     tuning_path.write_text(json.dumps({"db/task": {}}))
     testing_path.write_text(json.dumps({"config": {}}))
-    tuning_args = {"ckpt": "unused", "grid_stem": grid, "task_list": [("db", "task")]}
+    tuning_args = {"ckpt": str(ckpt), "grid_stem": grid, "task_list": [("db", "task")]}
     testing_args = tuning_args | {"configs_path": "unused", "out_subdir": "results"}
     for function, args in ((tune.jobs, tuning_args), (ensemble.jobs, testing_args)):
         with pytest.raises(
