@@ -180,7 +180,14 @@ class Muon(Optimizer):
                 loss = closure()
         lrs = [
             torch.tensor(
-                group["lr"], dtype=torch.float64, device=group["params"][0].device
+                group["lr"],
+                # FP64 scalars promote NPU foreach updates into AiCPU work.
+                dtype=(
+                    torch.float32
+                    if group["params"][0].device.type == "npu"
+                    else torch.float64
+                ),
+                device=group["params"][0].device,
             )
             for group in self.param_groups
         ]
