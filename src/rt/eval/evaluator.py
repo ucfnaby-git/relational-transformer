@@ -1,3 +1,4 @@
+import math
 import time
 
 import torch
@@ -154,7 +155,12 @@ class Evaluator:
                 if self.items_per_task is not None:
                     n_batches = min(
                         n_batches,
-                        max(1, self.items_per_task // self.eval_bs // world_size),
+                        max(
+                            1,
+                            math.ceil(
+                                self.items_per_task / (self.eval_bs * world_size)
+                            ),
+                        ),
                     )
 
                 preds_per_prefix_per_ctx = {
