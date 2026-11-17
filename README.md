@@ -89,8 +89,15 @@ disabled for the RT-J model, FlexAttention, block masks and Muon optimizer in
 this mode. The original attention implementation and relational masks are kept.
 Without this variable, the existing NVIDIA execution path is unchanged.
 
-This mode has model-level smoke coverage; the ARM sampler, complete pretraining
-recipes and distributed HCCL training still require validation.
+Automatic migration also defaults `TORCH_NPU_DEVICE_CAPABILITY` to `0.0` when
+unset. This is a PyTorch compatibility value, not an NPU hardware capability;
+it avoids a CUDA capability-query failure in `dist.broadcast`. An explicitly
+configured value is preserved.
+
+Model-level smoke coverage includes two-NPU HCCL DDP at 512 tokens, with
+gradient accumulation and FP32 or BF16 model weights (FP32 master weights for
+BF16). These checks use AdamW; the ARM sampler, complete pretraining recipes
+and distributed Muon optimizer still require validation.
 
 ## Examples
 
