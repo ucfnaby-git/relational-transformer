@@ -89,6 +89,20 @@ disabled for the RT-J model, FlexAttention, block masks and Muon optimizer in
 this mode. The original attention implementation and relational masks are kept.
 Without this variable, the existing NVIDIA execution path is unchanged.
 
+To select the native fused attention path through PyTorch SDPA on NPU, also set:
+
+```bash
+export RT_NPU_ATTENTION=sdpa
+```
+
+This uses the original relational boolean masks and `1 / head_dim` scale,
+disables attention dropout, and preserves zero outputs for fully masked rows.
+It requires `materialize_attn_masks=True`, as in the RT-J checkpoint configuration.
+The default `flex` mode keeps the original attention path for comparison.
+The selector applies only with `RT_AUTO_MIGRATE_NPU=1`; it does not change the
+NVIDIA path. This option does not enable graph compilation or establish full
+training/optimizer equivalence.
+
 Automatic migration also defaults `TORCH_NPU_DEVICE_CAPABILITY` to `0.0` when
 unset. This is a PyTorch compatibility value, not an NPU hardware capability;
 it avoids a CUDA capability-query failure in `dist.broadcast`. An explicitly

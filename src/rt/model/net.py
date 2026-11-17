@@ -11,6 +11,12 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from rt._npu import AUTO_MIGRATE_NPU
 from rt.model.checkpoints import MODEL_DIM_KEYS, load_model, resolve_checkpoint
 
+_NPU_ATTENTION = (
+    os.environ.get("RT_NPU_ATTENTION", "flex") if AUTO_MIGRATE_NPU else "flex"
+)
+if _NPU_ATTENTION not in ("flex", "sdpa"):
+    raise ValueError("RT_NPU_ATTENTION must be 'flex' or 'sdpa'")
+
 allow_ops_in_compiled_graph()
 if not AUTO_MIGRATE_NPU:
     flex_attention = torch.compile(flex_attention, dynamic=False)
@@ -73,13 +79,28 @@ class MaskedAttention(nn.Module):
 
         v = v.to(q.dtype)
 
-        attn_out = flex_attention(
-            q,
-            k,
-            v,
-            block_mask=block_mask,
-            scale=1.0 / self.head_dim,
-        )
+        if _NPU_ATTENTION == "sdpa":
+            attn_out = F.scaled_dot_product_attention(
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                attn_mask=block_mask[:, None],
+                dropout_p=0.0,
+                is_causal=False,
+                scale=1.0 / self.head_dim,
+            )
+            # Preserve FlexAttention's zero output for fully masked rows.
+            # Reuse the existing counts instead of reducing the dense mask
+            # again in every attention layer.
+            attn_out = torch.where(kv_sizes[:, None] > 0, attn_out, 0)
+        else:
+            attn_out = flex_attention(
+                q,
+                k,
+                v,
+                block_mask=block_mask,
+                scale=1.0 / self.head_dim,
+            )
         attn_out = rearrange(attn_out, "b h s d -> b s (h d)")
 
         gate = 2 * torch.sigmoid(self.wg(x))
@@ -138,6 +159,9 @@ class RelationalBlock(nn.Module):
 
 
 def _make_block_mask(mask, batch_size, q_seq_len, kv_seq_len, device):
+    if _NPU_ATTENTION == "sdpa":
+        return mask
+
     def _mod(b, h, q_idx, kv_idx):
         return mask[b, q_idx, kv_idx]
 
@@ -237,6 +261,8 @@ class RelationalTransformer(nn.Module):
             raise ValueError(
                 f"unknown loss_fn {loss_fn!r}; expected 'huber', 'l1' or 'bce'"
             )
+        if _NPU_ATTENTION == "sdpa" and not materialize_attn_masks:
+            raise ValueError("RT_NPU_ATTENTION=sdpa requires materialize_attn_masks=True")
         self.materialize_attn_masks = materialize_attn_masks
         self.loss_fn = loss_fn
         self.enc_dict = nn.ModuleDict(
