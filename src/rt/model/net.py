@@ -470,7 +470,8 @@ class RelationalTransformer(nn.Module):
             sem_type_mask = (sem_types == i) & masks
 
             if self.loss_fn == "huber":
-                loss_t = F.huber_loss(yhat, y, reduction="none").mean(-1)
+                # loss_t = F.huber_loss(yhat, y, reduction="none").mean(-1)
+                loss_t = F.smooth_l1_loss(yhat, y, beta=1.0, reduction="none").mean(-1)
             elif self.loss_fn == "l1":
                 loss_t = F.l1_loss(yhat, y, reduction="none").mean(-1)
             else:
