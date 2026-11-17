@@ -5,6 +5,8 @@ import torch
 from torch import Tensor
 from torch.optim.optimizer import Optimizer
 
+from rt._npu import AUTO_MIGRATE_NPU
+
 _DEFAULT_A = 3.4445
 _DEFAULT_B = -4.7750
 _DEFAULT_C = 2.0315
@@ -88,7 +90,7 @@ class Muon(Optimizer):
                 [_lr_factor(group["adjust_lr_fn"], p.shape) for p in group["params"]]
             )
 
-        if compile:
+        if compile and not AUTO_MIGRATE_NPU:
             self._step_impl = torch.compile(self._step_impl)
 
     @torch.no_grad()

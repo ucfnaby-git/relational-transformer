@@ -15,6 +15,7 @@ import wandb
 from torch import optim
 from torch.utils.data import DataLoader
 
+from rt._npu import AUTO_MIGRATE_NPU
 from rt.data import TrainDataset, get_tasks, stage_paths
 from rt.eval import Evaluator, member_context_seed, metric_for
 from rt.model import (
@@ -185,6 +186,7 @@ def main(
     wandb_disabled: bool,
     out_root: str,
 ) -> None:
+    compile = compile and not AUTO_MIGRATE_NPU
     params = dict(locals())
 
     assert not (set(train_splits) & set(eval_splits)), (

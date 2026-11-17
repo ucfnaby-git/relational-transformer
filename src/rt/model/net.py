@@ -8,10 +8,12 @@ from einops._torch_specific import allow_ops_in_compiled_graph
 from torch import nn
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
+from rt._npu import AUTO_MIGRATE_NPU
 from rt.model.checkpoints import MODEL_DIM_KEYS, load_model, resolve_checkpoint
 
 allow_ops_in_compiled_graph()
-flex_attention = torch.compile(flex_attention, dynamic=False)
+if not AUTO_MIGRATE_NPU:
+    flex_attention = torch.compile(flex_attention, dynamic=False)
 
 
 class RMSNorm(nn.Module):
@@ -146,7 +148,7 @@ def _make_block_mask(mask, batch_size, q_seq_len, kv_seq_len, device):
         Q_LEN=q_seq_len,
         KV_LEN=kv_seq_len,
         device=device,
-        _compile=True,
+        _compile=not AUTO_MIGRATE_NPU,
     )
 
 
@@ -273,7 +275,7 @@ class RelationalTransformer(nn.Module):
             nn.init.zeros_(module.weight)
             nn.init.zeros_(module.bias)
 
-        if compile:
+        if compile and not AUTO_MIGRATE_NPU:
             self.forward = torch.compile(self.forward, dynamic=False)
 
     @classmethod
@@ -412,7 +414,7 @@ class RelationalTransformer(nn.Module):
                 Q_LEN=seq_len,
                 KV_LEN=seq_len,
                 device=device,
-                _compile=True,
+                _compile=not AUTO_MIGRATE_NPU,
             )
             block_masks = {
                 "feat": make_bm(feat_mask_mod),

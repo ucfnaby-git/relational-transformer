@@ -74,6 +74,24 @@ cd relational-transformer
 pixi run python -m examples.eval.plan        # or examples.pretrain.phases, ...
 ```
 
+## Ascend automatic migration for RT-J
+
+With a compatible TorchNPU and CANN environment activated, set
+`RT_AUTO_MIGRATE_NPU=1` before importing `rt` or launching an existing recipe:
+
+```bash
+export RT_AUTO_MIGRATE_NPU=1
+```
+
+This imports TorchNPU's `transfer_to_npu` adapter before the RT model is loaded.
+Existing CUDA device arguments are handled by that adapter. Compilation is
+disabled for the RT-J model, FlexAttention, block masks and Muon optimizer in
+this mode. The original attention implementation and relational masks are kept.
+Without this variable, the existing NVIDIA execution path is unchanged.
+
+This mode has model-level smoke coverage; the ARM sampler, complete pretraining
+recipes and distributed HCCL training still require validation.
+
 ## Examples
 
 [`examples/`](https://github.com/stanford-star/relational-transformer/blob/main/examples/README.md) holds the recipes behind the released

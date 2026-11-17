@@ -1,5 +1,6 @@
 from importlib.metadata import PackageNotFoundError, version
 
+from rt import _npu as _npu
 from rt.model import RelationalTransformer
 
 try:
