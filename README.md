@@ -103,6 +103,26 @@ The selector applies only with `RT_AUTO_MIGRATE_NPU=1`; it does not change the
 NVIDIA path. This option does not enable graph compilation or establish full
 training/optimizer equivalence.
 
+For native attention with mask reuse, select:
+
+```bash
+export RT_NPU_ATTENTION=native
+```
+
+This calls the installed `torch_npu.npu_fusion_attention` API and prepares its
+blocked-position masks once per forward pass. Empty query rows receive a dummy
+key; the existing guard zeros their outputs and gradients. The original mask
+still determines attention counts and query scaling. This permits the native
+kernel's regular row handling while preserving the `1 / head_dim` scale.
+It also requires `materialize_attn_masks=True`.
+
+On 910B2 with CANN 9.2.1 and TorchNPU 2.14.0, full F1 classification (702 rows)
+and regression (760 rows) predictions matched `sdpa` bit for bit. Empty-row
+outputs and gradients were exactly zero. Operator tests against NVIDIA
+FlexAttention and real training-batch backward checks measured finite BF16
+differences; these checks do not establish convergence equivalence. This
+opt-in path uses the existing TorchNPU installation and keeps compilation off.
+
 For NPU Muon updates, the Newton-Schulz `baddbmm` calls use the native
 `USE_FP32_ADD` setting so the scaled addend is not rounded to BF16 before
 the matrix-product epilogue. The caller's precision setting is restored after
@@ -120,8 +140,9 @@ configured value is preserved.
 Model-level smoke coverage includes two-NPU HCCL DDP at 512 tokens, with
 gradient accumulation and FP32 or BF16 model weights (FP32 master weights for
 BF16). These checks use AdamW. The native ARM sampler and original evaluator
-also pass full F1-task inference at 8192 tokens; complete training recipes,
-checkpoint resume and distributed Muon still require validation.
+also pass full F1-task inference at 8192 tokens. Single-NPU original trainer
+checkpoint resume and classification/regression fine-tuning stage wiring pass
+bounded tests. Complete recipes and distributed Muon still require validation.
 
 ## Examples
 

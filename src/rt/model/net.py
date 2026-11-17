@@ -14,8 +14,10 @@ from rt.model.checkpoints import MODEL_DIM_KEYS, load_model, resolve_checkpoint
 _NPU_ATTENTION = (
     os.environ.get("RT_NPU_ATTENTION", "flex") if AUTO_MIGRATE_NPU else "flex"
 )
-if _NPU_ATTENTION not in ("flex", "sdpa"):
-    raise ValueError("RT_NPU_ATTENTION must be 'flex' or 'sdpa'")
+if _NPU_ATTENTION not in ("flex", "sdpa", "native"):
+    raise ValueError("RT_NPU_ATTENTION must be 'flex', 'sdpa' or 'native'")
+if _NPU_ATTENTION == "native":
+    import torch_npu
 
 allow_ops_in_compiled_graph()
 if not AUTO_MIGRATE_NPU:
@@ -79,16 +81,24 @@ class MaskedAttention(nn.Module):
 
         v = v.to(q.dtype)
 
-        if _NPU_ATTENTION == "sdpa":
-            attn_out = F.scaled_dot_product_attention(
-                q.contiguous(),
-                k.contiguous(),
-                v.contiguous(),
-                attn_mask=block_mask[:, None],
-                dropout_p=0.0,
-                is_causal=False,
-                scale=1.0 / self.head_dim,
-            )
+        if _NPU_ATTENTION in ("sdpa", "native"):
+            if _NPU_ATTENTION == "native":
+                attn_out = torch_npu.npu_fusion_attention(
+                    q.contiguous(), k.contiguous(), v.contiguous(),
+                    self.num_heads, "BNSD", atten_mask=block_mask,
+                    scale=1.0 / self.head_dim, keep_prob=1.0,
+                    sparse_mode=1, inner_precise=0,
+                )[0]
+            else:
+                attn_out = F.scaled_dot_product_attention(
+                    q.contiguous(),
+                    k.contiguous(),
+                    v.contiguous(),
+                    attn_mask=block_mask[:, None],
+                    dropout_p=0.0,
+                    is_causal=False,
+                    scale=1.0 / self.head_dim,
+                )
             # Preserve FlexAttention's zero output for fully masked rows.
             # Reuse the existing counts instead of reducing the dense mask
             # again in every attention layer.
@@ -158,7 +168,17 @@ class RelationalBlock(nn.Module):
         return x
 
 
-def _make_block_mask(mask, batch_size, q_seq_len, kv_seq_len, device):
+def _make_block_mask(mask, batch_size, q_seq_len, kv_seq_len, device, kv_sizes=None):
+    if _NPU_ATTENTION == "native":
+        # Counts and the outer attention guard use the original mask. A dummy
+        # key makes empty query rows safe for the regular native FA path;
+        # their output and gradient are zeroed by the existing outer guard.
+        valid = mask.any(-1) if kv_sizes is None else kv_sizes.squeeze(-1) > 0
+        first_key = torch.arange(kv_seq_len, device=device)[None, None] == 0
+        safe_mask = mask | ((~valid)[..., None] & first_key)
+        # Native FA uses True for blocked entries. Prepare once per forward,
+        # then reuse the same mask in all transformer blocks.
+        return (~safe_mask[:, None]).contiguous()
     if _NPU_ATTENTION == "sdpa":
         return mask
 
@@ -261,8 +281,8 @@ class RelationalTransformer(nn.Module):
             raise ValueError(
                 f"unknown loss_fn {loss_fn!r}; expected 'huber', 'l1' or 'bce'"
             )
-        if _NPU_ATTENTION == "sdpa" and not materialize_attn_masks:
-            raise ValueError("RT_NPU_ATTENTION=sdpa requires materialize_attn_masks=True")
+        if _NPU_ATTENTION in ("sdpa", "native") and not materialize_attn_masks:
+            raise ValueError("NPU dense attention requires materialize_attn_masks=True")
         self.materialize_attn_masks = materialize_attn_masks
         self.loss_fn = loss_fn
         self.enc_dict = nn.ModuleDict(
@@ -404,7 +424,7 @@ class RelationalTransformer(nn.Module):
                 device=device,
             )
             block_masks = {
-                attn_type: make_block_mask(attn_mask)
+                attn_type: make_block_mask(attn_mask, kv_sizes=kv_sizes[attn_type])
                 for attn_type, attn_mask in attn_masks.items()
             }
         else:
