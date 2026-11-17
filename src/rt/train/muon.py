@@ -1,5 +1,6 @@
 import math
 from collections import defaultdict
+from contextlib import contextmanager
 
 import torch
 from torch import Tensor
@@ -14,6 +15,23 @@ _DEFAULT_NS_STEPS = 5
 _EPS = 1e-7
 
 
+@contextmanager
+def _npu_fp32_add():
+    import torch_npu
+
+    previous = torch_npu.npu.matmul.cube_math_type
+    try:
+        torch_npu.npu.matmul.cube_math_type = torch_npu.npu.CubeMathType.USE_FP32_ADD
+        yield
+    finally:
+        if previous is None:
+            # The enum setter cannot restore None. An empty option restores the
+            # default passthrough to allow_hf32 in the installed torch_npu API.
+            torch_npu.npu.set_option({"CUBE_MATH_TYPE": ""})
+        else:
+            torch_npu.npu.matmul.cube_math_type = previous
+
+
 def _batched_newton_schulz(
     X: Tensor,
     steps: int,
@@ -26,8 +44,15 @@ def _batched_newton_schulz(
     X.div_(X.norm(dim=(-2, -1), keepdim=True).clamp(min=eps))
     for _ in range(steps):
         A = torch.bmm(X, X.transpose(-2, -1))
-        G = torch.baddbmm(A, A, A, beta=b, alpha=c)
-        X = torch.baddbmm(X, G, X, beta=a)
+        if X.device.type == "npu":
+            # Keep beta*self and the matmul epilogue in FP32, as on CUDA.
+            # Leave bmm and normalization under the caller's precision settings.
+            with _npu_fp32_add():
+                G = torch.baddbmm(A, A, A, beta=b, alpha=c)
+                X = torch.baddbmm(X, G, X, beta=a)
+        else:
+            G = torch.baddbmm(A, A, A, beta=b, alpha=c)
+            X = torch.baddbmm(X, G, X, beta=a)
     return X
 
 

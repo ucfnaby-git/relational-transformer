@@ -103,6 +103,15 @@ The selector applies only with `RT_AUTO_MIGRATE_NPU=1`; it does not change the
 NVIDIA path. This option does not enable graph compilation or establish full
 training/optimizer equivalence.
 
+For NPU Muon updates, the Newton-Schulz `baddbmm` calls use the native
+`USE_FP32_ADD` setting so the scaled addend is not rounded to BF16 before
+the matrix-product epilogue. The caller's precision setting is restored after
+these calls, including on exceptions. This option is process-wide during the
+calls; concurrent operator dispatch in the same process is not isolated.
+CUDA updates are unchanged. A three-step replay of all 216 Muon tensors using
+real training gradients reduced the NPU update difference versus CUDA from
+12.75% to 0.72%; this does not establish convergence equivalence.
+
 Automatic migration also defaults `TORCH_NPU_DEVICE_CAPABILITY` to `0.0` when
 unset. This is a PyTorch compatibility value, not an NPU hardware capability;
 it avoids a CUDA capability-query failure in `dist.broadcast`. An explicitly
@@ -110,8 +119,9 @@ configured value is preserved.
 
 Model-level smoke coverage includes two-NPU HCCL DDP at 512 tokens, with
 gradient accumulation and FP32 or BF16 model weights (FP32 master weights for
-BF16). These checks use AdamW; the ARM sampler, complete pretraining recipes
-and distributed Muon optimizer still require validation.
+BF16). These checks use AdamW. The native ARM sampler and original evaluator
+also pass full F1-task inference at 8192 tokens; complete training recipes,
+checkpoint resume and distributed Muon still require validation.
 
 ## Examples
 
